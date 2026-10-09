@@ -1,3 +1,6 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
 import { Injectable, OnModuleInit, OnModuleDestroy, Logger } from '@nestjs/common';
 import { Bot, InlineKeyboard, Keyboard, InputFile } from 'grammy';
 import { PrismaService } from '../database/prisma.service.js';
@@ -16,8 +19,8 @@ import {
   QuizStatus,
   QuizSessionMode,
   SessionStatus,
-  IssueSeverity,
 } from '@smart-quiz/shared';
+import { QuizQueueService, PollTimerJobData } from '../queue/quiz-queue.service.js';
 
 @Injectable()
 export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
@@ -27,14 +30,22 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
   private userStates = new Map<string, { step: string; data?: any }>();
   private activeTimers = new Map<string, NodeJS.Timeout>();
 
-  constructor(private prisma: PrismaService) {
+  constructor(
+    private prisma: PrismaService,
+    private quizQueueService: QuizQueueService
+  ) {
     this.config = loadConfig();
   }
 
   async onModuleInit() {
+    // Register durable timeout handler with queue service
+    this.quizQueueService.registerPollTimeoutHandler(async (data) => {
+      await this.handleQuestionTimeout(data);
+    });
+
     if (!this.config.botToken || this.config.botToken.includes('123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ')) {
       this.logger.warn(
-        '⚠️ Telegram BOT_TOKEN haqiqiy token emas yoki belgilanmagan. Bot faqat simulyatsiya/API rejimida ishlaydi. Iltimos .env faylida BOT_TOKEN ni sozlang.'
+        '⚠️ Telegram BOT_TOKEN haqiqiy token emas yoki belgilanmagan. Bot API rejimida ishlaydi. Iltimos .env faylida BOT_TOKEN ni sozlang.'
       );
       return;
     }
@@ -46,12 +57,14 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       if (!this.config.telegramWebhookUrl) {
         this.logger.log('🚀 Telegram bot Long Polling rejimida ishga tushirilmoqda...');
         this.bot.start({
-          onStart: (botInfo) => {
+          onStart: async (botInfo) => {
             this.logger.log(`✅ Telegram bot muvaffaqiyatli ulandi: @${botInfo.username}`);
+            await this.recoverActiveSessions();
           },
         });
       } else {
         this.logger.log(`🌐 Telegram bot Webhook rejimida: ${this.config.telegramWebhookUrl}`);
+        await this.recoverActiveSessions();
       }
     } catch (err: any) {
       this.logger.error(`❌ Telegram botni ishga tushirishda xatolik: ${err.message}`);
@@ -73,6 +86,59 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     return this.bot;
   }
 
+  /**
+   * Recovers active sessions after process restart so no quiz poll remains stuck.
+   */
+  private async recoverActiveSessions() {
+    try {
+      const activeSessions = await this.prisma.quizSession.findMany({
+        where: { status: SessionStatus.ACTIVE },
+        include: {
+          pollInstances: {
+            where: { isOpen: true },
+            orderBy: { sentAt: 'desc' },
+            take: 1,
+          },
+        },
+      });
+
+      for (const session of activeSessions) {
+        const activePoll = session.pollInstances[0];
+        if (!activePoll || !session.telegramChatId) continue;
+
+        const timeLimit = (session.settingsSnapshot as any)?.timeLimitPerQuestionSeconds ?? 30;
+        if (timeLimit > 0 && activePoll.expiresAt) {
+          const remainingMs = activePoll.expiresAt.getTime() - Date.now();
+          if (remainingMs <= 0) {
+            // Already expired while offline -> advance immediately
+            await this.handleQuestionTimeout({
+              sessionId: session.id,
+              questionIndex: session.currentQuestionIndex,
+              telegramPollId: activePoll.telegramPollId,
+              chatId: Number(session.telegramChatId),
+              messageId: activePoll.messageId || undefined,
+            });
+          } else {
+            // Re-schedule remaining time
+            const delaySec = Math.ceil(remainingMs / 1000);
+            await this.quizQueueService.schedulePollTimeout(
+              {
+                sessionId: session.id,
+                questionIndex: session.currentQuestionIndex,
+                telegramPollId: activePoll.telegramPollId,
+                chatId: Number(session.telegramChatId),
+                messageId: activePoll.messageId || undefined,
+              },
+              delaySec
+            );
+          }
+        }
+      }
+    } catch (err: any) {
+      this.logger.warn(`Sessiyalarni tiklashda ogohlantirish: ${err.message}`);
+    }
+  }
+
   private registerHandlers() {
     if (!this.bot) return;
 
@@ -82,7 +148,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       if (!from) return;
 
       const user = await this.upsertTelegramUser(from);
-      const text = ctx.match; // Payload from deep link: e.g. /start quiz_123
+      const text = ctx.match;
 
       if (text && text.startsWith('quiz_')) {
         const quizId = text.replace('quiz_', '');
@@ -207,33 +273,79 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         const state = this.userStates.get(ctx.from!.id.toString());
         const quizTitle = state?.data?.title || fileName.replace(/\.docx$/i, '');
 
-        // Save Quiz to database
+        // Save extracted images and link to questions
+        const savedMediaMap = new Map<string, string>(); // hash -> mediaAssetId
+        for (const q of parseResult.questions) {
+          for (const img of q.images) {
+            if (img.buffer && !savedMediaMap.has(img.hash)) {
+              const ext = img.mimeType.split('/').pop() || 'png';
+              const filename = `${crypto.randomUUID()}.${ext}`;
+              const filePath = path.join(this.config.mediaStoragePath, filename);
+              fs.writeFileSync(filePath, img.buffer);
+
+              const mediaRecord = await this.prisma.mediaAsset.create({
+                data: {
+                  originalName: img.originalName,
+                  fileName: filename,
+                  mimeType: img.mimeType,
+                  sizeBytes: img.buffer.length,
+                  path: filePath,
+                  url: `/media/${filename}`,
+                  ownerId: user.id,
+                },
+              });
+              savedMediaMap.set(img.hash, mediaRecord.id);
+            }
+          }
+        }
+
+        // Save Quiz to database with assets linked
         const quiz = await this.prisma.quiz.create({
           data: {
             title: quizTitle,
             creatorId: user.id,
             status: QuizStatus.PUBLISHED,
             currentVersion: 1,
+            settings: {
+              timeLimitPerQuestionSeconds: 30,
+              shuffleQuestions: false,
+              shuffleOptions: false,
+              showExplanation: true,
+            },
             versions: {
               create: {
                 versionNumber: 1,
                 title: quizTitle,
                 questions: {
-                  create: parseResult.questions.map((q) => ({
-                    questionIndex: q.index,
-                    text: q.text,
-                    explanation: q.explanation || null,
-                    hasMath: q.hasMath,
-                    hasChemistry: q.hasChemistry,
-                    points: 1,
-                    options: {
-                      create: q.options.map((opt) => ({
-                        optionIndex: opt.index,
-                        text: opt.text,
-                        isCorrect: opt.isCorrect,
-                      })),
-                    },
-                  })),
+                  create: parseResult.questions.map((q) => {
+                    const questionMediaIds = q.images
+                      .map((img) => savedMediaMap.get(img.hash))
+                      .filter(Boolean) as string[];
+
+                    return {
+                      questionIndex: q.index,
+                      text: q.text,
+                      explanation: q.explanation || null,
+                      hasMath: q.hasMath,
+                      hasChemistry: q.hasChemistry,
+                      points: 1,
+                      options: {
+                        create: q.options.map((opt) => ({
+                          optionIndex: opt.index,
+                          text: opt.text,
+                          isCorrect: opt.isCorrect,
+                        })),
+                      },
+                      assets: questionMediaIds.length > 0
+                        ? {
+                            create: questionMediaIds.map((mediaId) => ({
+                              mediaAssetId: mediaId,
+                              assetType: 'QUESTION_IMAGE',
+                            })),
+                          }
+                        : undefined,
+                    };
+                  }),
                 },
               },
             },
@@ -275,7 +387,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       }
     });
 
-    // 6. Text message router (conversations)
+    // 6. Text message router
     this.bot.on('message:text', async (ctx) => {
       const from = ctx.from;
       if (!from) return;
@@ -292,43 +404,47 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       }
     });
 
-    // 7. Callback query handlers (Inline button clicks)
+    // 7. Callback query handlers
     this.bot.on('callback_query:data', async (ctx) => {
       const data = ctx.callbackQuery.data;
       const user = await this.upsertTelegramUser(ctx.from);
 
-      // Join Quiz Session in Group
       if (data.startsWith('join_session_')) {
         const sessionId = data.replace('join_session_', '');
         await this.handleJoinSession(ctx, user, sessionId);
         return;
       }
 
-      // Start Quiz Session in Group
       if (data.startsWith('launch_session_')) {
         const sessionId = data.replace('launch_session_', '');
         await this.handleLaunchSession(ctx, user, sessionId);
         return;
       }
 
-      // Start Group Session prompt
+      if (data.startsWith('next_question_')) {
+        const parts = data.replace('next_question_', '').split('_');
+        const sessionId = parts[0];
+        const nextIdx = parseInt(parts[1], 10);
+        await this.handleManualNextQuestion(ctx, user, sessionId, nextIdx);
+        return;
+      }
+
       if (data.startsWith('start_group_')) {
         const quizId = data.replace('start_group_', '');
         await this.promptStartGroupSession(ctx, quizId);
         return;
       }
 
-      // Excel Report download
       if (data.startsWith('excel_report_')) {
         const sessionId = data.replace('excel_report_', '');
-        await this.handleSendExcelReport(ctx, sessionId);
+        await this.handleSendExcelReport(ctx, user, sessionId);
         return;
       }
 
       await ctx.answerCallbackQuery();
     });
 
-    // 8. poll_answer listener (Native Telegram Quiz Poll answers)
+    // 8. poll_answer listener with IDEMPOTENT SCORING
     this.bot.on('poll_answer', async (ctx) => {
       await this.handlePollAnswer(ctx);
     });
@@ -468,8 +584,8 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     await ctx.answerCallbackQuery();
     await ctx.reply(
       `📌 <b>Testni guruhda o‘tkazish uchun:</b>\n\n` +
-      `1. Botni guruhingizga qo‘shing va xabar yuborish huquqini bering.\n` +
-      `2. Guruhingizda quyidagi buyruqni yozing:\n\n` +
+      `1. Botni guruhingizga qo‘shing va admin huquqini bering.\n` +
+      `2. Guruhingizda quyidagi buyruqni yuboring:\n\n` +
       `<code>/startquiz ${quiz.id}</code>`,
       { parse_mode: 'HTML' }
     );
@@ -503,11 +619,17 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
+    // Authorization check
+    if (quiz.creatorId !== user.id && quiz.status !== QuizStatus.PUBLISHED && user.role !== UserRole.SUPER_ADMIN) {
+      await ctx.reply('❌ Ushbu testdan foydalanish huquqiga ega emassiz');
+      return;
+    }
+
     const version = quiz.versions[0];
     const questionsCount = version.questions.length;
-    const timePerQuestion = (quiz.settings as any)?.timeLimitPerQuestionSeconds || 30;
+    // FIX: Use nullish coalescing ?? so 0 (untimed) is not overridden with 30!
+    const timePerQuestion = (quiz.settings as any)?.timeLimitPerQuestionSeconds ?? 30;
 
-    // Create QuizSession in DB
     const session = await this.prisma.quizSession.create({
       data: {
         quizVersionId: version.id,
@@ -570,7 +692,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     await ctx.answerCallbackQuery({ text: 'Siz ro‘yxatga olindingiz! ✅' });
 
     // Update lobby message count
-    const timePerQuestion = (session.settingsSnapshot as any)?.timeLimitPerQuestionSeconds || 30;
+    const timePerQuestion = (session.settingsSnapshot as any)?.timeLimitPerQuestionSeconds ?? 30;
     const questionsCount = await this.prisma.question.count({
       where: { quizVersionId: session.quizVersionId },
     });
@@ -625,9 +747,19 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     });
 
     await ctx.reply('🚀 <b>Test boshlandi! Diqqat, 1-savol:</b>', { parse_mode: 'HTML' });
-
-    // Send question 0
     await this.dispatchQuestion(session.id, 0);
+  }
+
+  private async handleManualNextQuestion(ctx: any, user: any, sessionId: string, nextIdx: number) {
+    const session = await this.prisma.quizSession.findUnique({ where: { id: sessionId } });
+    if (!session) return;
+    if (session.createdById !== user.id && user.role !== UserRole.SUPER_ADMIN) {
+      await ctx.answerCallbackQuery({ text: 'Faqat test muallifi savolni o‘tkazishi mumkin!', show_alert: true });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: 'Keyingi savolga o‘tilmoqda...' });
+    await this.dispatchQuestion(sessionId, nextIdx);
   }
 
   private async dispatchQuestion(sessionId: string, questionIndex: number) {
@@ -640,7 +772,10 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
           include: {
             questions: {
               orderBy: { questionIndex: 'asc' },
-              include: { options: true },
+              include: {
+                options: true,
+                assets: { include: { mediaAsset: true } },
+              },
             },
           },
         },
@@ -651,13 +786,13 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
 
     const questions = session.quizVersion.questions;
     if (questionIndex >= questions.length) {
-      // All questions completed!
       await this.finalizeQuizSession(sessionId);
       return;
     }
 
     const q = questions[questionIndex];
-    const timeLimit = (session.settingsSnapshot as any)?.timeLimitPerQuestionSeconds || 30;
+    // FIX: Respect untimed tests with ?? 30
+    const timeLimit = (session.settingsSnapshot as any)?.timeLimitPerQuestionSeconds ?? 30;
 
     const pollData = buildTelegramQuizPoll(
       {
@@ -682,12 +817,27 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
 
     const chatId = Number(session.telegramChatId);
 
-    // If companion message exists (e.g. text > 300 chars or math/chemistry card)
+    // 1. If question has attached images or diagrams, send photo first!
+    if (q.assets && q.assets.length > 0 && q.assets[0].mediaAsset) {
+      const media = q.assets[0].mediaAsset;
+      if (fs.existsSync(media.path)) {
+        try {
+          await this.bot.api.sendPhoto(chatId, new InputFile(media.path), {
+            caption: `🖼 <b>${q.questionIndex}-savol uchun ilova rasm:</b>`,
+            parse_mode: 'HTML',
+          });
+        } catch (e: any) {
+          this.logger.warn(`Rasm yuborishda xatolik: ${e.message}`);
+        }
+      }
+    }
+
+    // 2. If companion message exists (long text, formula card)
     if (pollData.companionMessage) {
       await this.bot.api.sendMessage(chatId, pollData.companionMessage, { parse_mode: 'HTML' });
     }
 
-    // Send native Telegram Quiz Poll!
+    // 3. Send native Telegram Quiz Poll!
     const pollMsg = await this.bot.api.sendPoll(chatId, pollData.question, pollData.options, {
       type: 'quiz',
       is_anonymous: false,
@@ -696,7 +846,9 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       open_period: pollData.open_period,
     } as any);
 
-    // Save PollInstance in database
+    const expiresAt = timeLimit > 0 ? new Date(Date.now() + timeLimit * 1000) : null;
+
+    // Save PollInstance in database with expiration timestamp
     await this.prisma.pollInstance.create({
       data: {
         sessionId,
@@ -706,7 +858,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         chatId: session.telegramChatId,
         correctOptionId: pollData.correct_option_id,
         isOpen: true,
-        expiresAt: timeLimit > 0 ? new Date(Date.now() + timeLimit * 1000) : null,
+        expiresAt,
       },
     });
 
@@ -715,23 +867,77 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       data: { currentQuestionIndex: questionIndex },
     });
 
-    // Schedule next question progression
+    // 4. Handle Timers & Progression:
     if (timeLimit > 0) {
+      // Schedule durable background queue timeout (BullMQ + DB recovery)
+      await this.quizQueueService.schedulePollTimeout(
+        {
+          sessionId,
+          questionIndex,
+          telegramPollId: pollMsg.poll.id,
+          chatId,
+          messageId: pollMsg.message_id,
+        },
+        timeLimit + 2
+      );
+
+      // In-memory immediate timer
       const timerKey = `timer_${sessionId}_${questionIndex}`;
       const timer = setTimeout(async () => {
         this.activeTimers.delete(timerKey);
-        try {
-          // Close poll if still open
-          await this.bot?.api.stopPoll(chatId, pollMsg.message_id);
-        } catch {}
-        // Dispatch next question
-        await this.dispatchQuestion(sessionId, questionIndex + 1);
+        await this.handleQuestionTimeout({
+          sessionId,
+          questionIndex,
+          telegramPollId: pollMsg.poll.id,
+          chatId,
+          messageId: pollMsg.message_id,
+        });
       }, (timeLimit + 2) * 1000);
 
       this.activeTimers.set(timerKey, timer);
+    } else {
+      // Untimed Quiz: provide teacher with explicit progression button
+      const nextBtn = new InlineKeyboard().text(
+        '➡️ Keyingi savolga o‘tish',
+        `next_question_${sessionId}_${questionIndex + 1}`
+      );
+      await this.bot.api.sendMessage(chatId, '⏱ Ushbu savol vaqti cheklanmagan. Tayyor bo‘lgach keyingisiga o‘ting:', {
+        reply_markup: nextBtn,
+      });
     }
   }
 
+  /**
+   * Safe, idempotent question timeout handler.
+   */
+  private async handleQuestionTimeout(data: PollTimerJobData) {
+    const poll = await this.prisma.pollInstance.findUnique({
+      where: { telegramPollId: data.telegramPollId },
+      include: { session: true },
+    });
+
+    if (!poll || !poll.isOpen) return; // Already closed/advanced
+
+    // Mark closed in database
+    await this.prisma.pollInstance.update({
+      where: { id: poll.id },
+      data: { isOpen: false, closedAt: new Date() },
+    });
+
+    if (this.bot && data.messageId) {
+      try {
+        await this.bot.api.stopPoll(data.chatId, data.messageId);
+      } catch {}
+    }
+
+    // Advance to next question
+    await this.dispatchQuestion(data.sessionId, data.questionIndex + 1);
+  }
+
+  /**
+   * Idempotent poll answer handler.
+   * Completely eliminates duplicate score increments and handles answer changes correctly!
+   */
   private async handlePollAnswer(ctx: any) {
     const pollAnswer = ctx.pollAnswer;
     const pollId = pollAnswer.poll_id;
@@ -749,46 +955,91 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     const isCorrect = selectedOptionIds.includes(pollInstance.correctOptionId);
     const responseTimeMs = Math.max(0, Date.now() - pollInstance.sentAt.getTime());
 
-    // Record answer
-    await this.prisma.pollAnswer.upsert({
+    const existingAnswer = await this.prisma.pollAnswer.findUnique({
       where: {
         pollInstanceId_userId: { pollInstanceId: pollInstance.id, userId: user.id },
       },
-      update: {
-        selectedOptions: selectedOptionIds,
-        isCorrect,
-        responseTimeMs,
-      },
-      create: {
-        pollInstanceId: pollInstance.id,
-        userId: user.id,
-        telegramPollId: pollId,
-        selectedOptions: selectedOptionIds,
-        isCorrect,
-        responseTimeMs,
-      },
     });
 
-    // Update participant score
-    await this.prisma.sessionParticipant.upsert({
-      where: {
-        sessionId_userId: { sessionId: pollInstance.sessionId, userId: user.id },
-      },
-      update: {
-        score: { increment: isCorrect ? 1 : 0 },
-        totalAnswered: { increment: 1 },
-        totalCorrect: { increment: isCorrect ? 1 : 0 },
-        totalTimeMs: { increment: BigInt(responseTimeMs) },
-      },
-      create: {
-        sessionId: pollInstance.sessionId,
-        userId: user.id,
-        score: isCorrect ? 1 : 0,
-        totalAnswered: 1,
-        totalCorrect: isCorrect ? 1 : 0,
-        totalTimeMs: BigInt(responseTimeMs),
-      },
+    if (existingAnswer) {
+      // Prevent duplicate update delivery from inflating score or totalAnswered
+      const oldScore = existingAnswer.isCorrect ? 1 : 0;
+      const newScore = isCorrect ? 1 : 0;
+      const deltaScore = newScore - oldScore;
+
+      await this.prisma.pollAnswer.update({
+        where: { id: existingAnswer.id },
+        data: {
+          selectedOptions: selectedOptionIds,
+          isCorrect,
+          responseTimeMs,
+        },
+      });
+
+      if (deltaScore !== 0) {
+        await this.prisma.sessionParticipant.update({
+          where: {
+            sessionId_userId: { sessionId: pollInstance.sessionId, userId: user.id },
+          },
+          data: {
+            score: { increment: deltaScore },
+            totalCorrect: { increment: deltaScore },
+          },
+        });
+      }
+    } else {
+      // First time answering this poll
+      await this.prisma.pollAnswer.create({
+        data: {
+          pollInstanceId: pollInstance.id,
+          userId: user.id,
+          telegramPollId: pollId,
+          selectedOptions: selectedOptionIds,
+          isCorrect,
+          responseTimeMs,
+        },
+      });
+
+      await this.prisma.sessionParticipant.upsert({
+        where: {
+          sessionId_userId: { sessionId: pollInstance.sessionId, userId: user.id },
+        },
+        update: {
+          score: { increment: isCorrect ? 1 : 0 },
+          totalAnswered: { increment: 1 },
+          totalCorrect: { increment: isCorrect ? 1 : 0 },
+          totalTimeMs: { increment: BigInt(responseTimeMs) },
+        },
+        create: {
+          sessionId: pollInstance.sessionId,
+          userId: user.id,
+          score: isCorrect ? 1 : 0,
+          totalAnswered: 1,
+          totalCorrect: isCorrect ? 1 : 0,
+          totalTimeMs: BigInt(responseTimeMs),
+        },
+      });
+    }
+
+    // Check if all registered participants have answered
+    const totalParticipants = await this.prisma.sessionParticipant.count({
+      where: { sessionId: pollInstance.sessionId },
     });
+    const totalAnswers = await this.prisma.pollAnswer.count({
+      where: { pollInstanceId: pollInstance.id },
+    });
+
+    if (totalParticipants > 0 && totalAnswers >= totalParticipants && pollInstance.isOpen) {
+      // Everyone answered -> Advance to next question immediately
+      this.logger.log(`🎯 Barcha ishtirokchilar javob berdi (${totalAnswers}/${totalParticipants}). Keyingi savolga o‘tilmoqda...`);
+      await this.handleQuestionTimeout({
+        sessionId: pollInstance.sessionId,
+        questionIndex: pollInstance.session.currentQuestionIndex,
+        telegramPollId: pollInstance.telegramPollId,
+        chatId: Number(pollInstance.chatId || 0),
+        messageId: pollInstance.messageId || undefined,
+      });
+    }
   }
 
   private async finalizeQuizSession(sessionId: string) {
@@ -845,9 +1096,11 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  private async handleSendExcelReport(ctx: any, sessionId: string) {
-    await ctx.answerCallbackQuery({ text: 'Hisobot tayyorlanmoqda... ⏳' });
-
+  /**
+   * Excel export with STRICT AUTHORIZATION check:
+   * Only the session creator or Super Admin can receive the full group report!
+   */
+  private async handleSendExcelReport(ctx: any, user: any, sessionId: string) {
     const session = await this.prisma.quizSession.findUnique({
       where: { id: sessionId },
       include: {
@@ -873,6 +1126,17 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     });
 
     if (!session) return;
+
+    // PRIVACY CHECK: Verify user is session creator or Super Admin
+    if (session.createdById !== user.id && user.role !== UserRole.SUPER_ADMIN) {
+      await ctx.answerCallbackQuery({
+        text: '❌ Ushbu hisobotni faqat test muallifi yuklab olishi mumkin!',
+        show_alert: true,
+      });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: 'Hisobot tayyorlanmoqda... ⏳' });
 
     const totalQuestions = session.quizVersion.questions.length;
     const generalResults = session.participants.map((p, idx) => ({

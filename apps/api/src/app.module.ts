@@ -9,10 +9,12 @@ import { QuestionBankModule } from './question-bank/question-bank.module.js';
 import { StudentModule } from './student/student.module.js';
 import { AdminModule } from './admin/admin.module.js';
 import { TelegramBotModule } from './bot/telegram-bot.module.js';
+import { QuizQueueModule } from './queue/quiz-queue.module.js';
 
 @Module({
   imports: [
     DatabaseModule,
+    QuizQueueModule,
     AuthModule,
     QuizzesModule,
     ImportModule,

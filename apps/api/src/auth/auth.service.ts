@@ -1,15 +1,17 @@
-import { Injectable, UnauthorizedException, BadRequestException } from '@nestjs/common';
+import { Injectable, UnauthorizedException, BadRequestException, ForbiddenException } from '@nestjs/common';
 import jwt from 'jsonwebtoken';
 import { PrismaService } from '../database/prisma.service.js';
-import { loadConfig } from '../config/configuration.js';
+import { loadConfig, AppConfig } from '../config/configuration.js';
 import { validateTelegramInitData } from './telegram-validator.js';
 import { UserRole, AuthUser } from '@smart-quiz/shared';
 
 @Injectable()
 export class AuthService {
-  private config = loadConfig();
+  private config: AppConfig;
 
-  constructor(private prisma: PrismaService) {}
+  constructor(private prisma: PrismaService) {
+    this.config = loadConfig();
+  }
 
   /**
    * Validates Telegram Mini App initData and logs in or registers the user.
@@ -46,6 +48,10 @@ export class AuthService {
       },
     });
 
+    if (!user.isActive) {
+      throw new ForbiddenException('Ushbu hisob administrator tomonidan to‘xtatilgan');
+    }
+
     const authUser: AuthUser = {
       id: user.id,
       telegramId: user.telegramId.toString(),
@@ -61,14 +67,25 @@ export class AuthService {
   }
 
   /**
-   * Development or Teacher Web Login (by Telegram ID or Demo username)
+   * Web Login for local development and testing.
+   * SECURITY: In production, passwordless credential login is strictly forbidden.
+   * Super-admin role can NEVER be claimed via client input; it must strictly match SUPER_ADMIN_TELEGRAM_IDS.
    */
-  async loginWithCredentials(identifier: string, role = UserRole.TEACHER): Promise<{ token: string; user: AuthUser }> {
+  async loginWithCredentials(identifier: string, requestedRole = UserRole.TEACHER): Promise<{ token: string; user: AuthUser }> {
+    if (this.config.nodeEnv === 'production') {
+      throw new ForbiddenException(
+        'Ishlab chiqarish (production) muhitida parolsiz login taqiqlangan. Iltimos Telegram Mini App orqali kiring.'
+      );
+    }
+
+    if (!identifier || identifier.trim() === '') {
+      throw new BadRequestException('Foydalanuvchi identifikatori kiritilishi shart');
+    }
+
     let numericId: bigint;
     if (/^\d+$/.test(identifier)) {
       numericId = BigInt(identifier);
     } else {
-      // Deterministic fake telegramId for demo usernames
       let hash = 0;
       for (let i = 0; i < identifier.length; i++) {
         hash = (hash << 5) - hash + identifier.charCodeAt(i);
@@ -77,20 +94,30 @@ export class AuthService {
       numericId = BigInt(Math.abs(hash) + 1000000);
     }
 
-    const isSuperAdmin = this.config.superAdminTelegramIds.includes(numericId.toString()) || role === UserRole.SUPER_ADMIN;
+    // STRICT: Only grant SUPER_ADMIN if ID is genuinely present in SUPER_ADMIN_TELEGRAM_IDS
+    const isSuperAdmin = this.config.superAdminTelegramIds.includes(numericId.toString());
+    const assignedRole = isSuperAdmin
+      ? UserRole.SUPER_ADMIN
+      : requestedRole === UserRole.STUDENT
+      ? UserRole.STUDENT
+      : UserRole.TEACHER;
 
     const user = await this.prisma.user.upsert({
       where: { telegramId: numericId },
       update: {
-        role: isSuperAdmin ? UserRole.SUPER_ADMIN : role,
+        role: isSuperAdmin ? UserRole.SUPER_ADMIN : assignedRole,
       },
       create: {
         telegramId: numericId,
         username: identifier.startsWith('@') ? identifier.slice(1) : identifier,
         firstName: identifier,
-        role: isSuperAdmin ? UserRole.SUPER_ADMIN : role,
+        role: assignedRole,
       },
     });
+
+    if (!user.isActive) {
+      throw new ForbiddenException('Ushbu hisob administrator tomonidan to‘xtatilgan');
+    }
 
     const authUser: AuthUser = {
       id: user.id,

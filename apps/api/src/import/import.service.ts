@@ -3,15 +3,16 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { Injectable, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../database/prisma.service.js';
-import { loadConfig } from '../config/configuration.js';
+import { loadConfig, AppConfig } from '../config/configuration.js';
 import { parseDocxBuffer } from '@smart-quiz/docx-parser';
 import { DocxParseResult, QuizStatus, UserRole } from '@smart-quiz/shared';
 
 @Injectable()
 export class ImportService {
-  private config = loadConfig();
+  private config: AppConfig;
 
   constructor(private prisma: PrismaService) {
+    this.config = loadConfig();
     this.ensureStorageDirs();
   }
 
@@ -37,8 +38,8 @@ export class ImportService {
     // Parse DOCX
     const parseResult = await parseDocxBuffer(file.buffer);
 
-    // Save extracted images to media storage
-    const savedMediaMap = new Map<string, string>(); // hash -> mediaAssetId
+    // Save extracted images to media storage and map hash to mediaAssetId
+    const savedMediaMap = new Map<string, { id: string; url: string; path: string }>();
     for (const q of parseResult.questions) {
       for (const img of q.images) {
         if (img.buffer && !savedMediaMap.has(img.hash)) {
@@ -58,7 +59,19 @@ export class ImportService {
               ownerId: userId,
             },
           });
-          savedMediaMap.set(img.hash, mediaRecord.id);
+          savedMediaMap.set(img.hash, {
+            id: mediaRecord.id,
+            url: mediaRecord.url || `/media/${filename}`,
+            path: filePath,
+          });
+        }
+
+        // Attach saved media metadata to parsed question image
+        const saved = savedMediaMap.get(img.hash);
+        if (saved) {
+          (img as any).mediaAssetId = saved.id;
+          (img as any).url = saved.url;
+          (img as any).filePath = saved.path;
         }
       }
     }
@@ -122,7 +135,27 @@ export class ImportService {
                     isCorrect: Boolean(opt.isCorrect),
                   })),
                 },
+                assets: q.images && q.images.length > 0 && q.images[0].mediaAssetId
+                  ? {
+                      create: q.images.map((img: any) => ({
+                        mediaAssetId: img.mediaAssetId,
+                        assetType: 'QUESTION_IMAGE',
+                      })),
+                    }
+                  : undefined,
               })),
+            },
+          },
+        },
+      },
+      include: {
+        versions: {
+          include: {
+            questions: {
+              include: {
+                options: true,
+                assets: { include: { mediaAsset: true } },
+              },
             },
           },
         },

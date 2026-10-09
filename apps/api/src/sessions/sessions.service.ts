@@ -1,7 +1,7 @@
-import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, ForbiddenException } from '@nestjs/common';
 import { PrismaService } from '../database/prisma.service.js';
 import { calculateLeaderboard, ParticipantScoreInput } from '@smart-quiz/quiz-engine';
-import { QuizSessionMode, SessionStatus, UserRole } from '@smart-quiz/shared';
+import { QuizSessionMode, SessionStatus, UserRole, QuizStatus } from '@smart-quiz/shared';
 
 @Injectable()
 export class SessionsService {
@@ -31,6 +31,11 @@ export class SessionsService {
 
     if (!quiz || quiz.versions.length === 0) {
       throw new NotFoundException('Test topilmadi');
+    }
+
+    // SECURITY CHECK: Verify caller owns the quiz or it is officially published
+    if (quiz.creatorId !== userId && quiz.status !== QuizStatus.PUBLISHED) {
+      throw new ForbiddenException('Ushbu testdan foydalanish yoki sessiya yaratish uchun ruxsatingiz yo‘q');
     }
 
     const version = quiz.versions[0];
@@ -159,6 +164,10 @@ export class SessionsService {
     };
   }
 
+  /**
+   * Records poll answer with idempotent scoring.
+   * Duplicate webhook deliveries will NEVER inflate totalAnswered or score!
+   */
   async recordPollAnswer(
     pollInstanceId: string,
     userId: string,
@@ -173,17 +182,46 @@ export class SessionsService {
 
     if (!poll) return null;
 
-    // Record answer
-    const answer = await this.prisma.pollAnswer.upsert({
+    const existingAnswer = await this.prisma.pollAnswer.findUnique({
       where: {
         pollInstanceId_userId: { pollInstanceId, userId },
       },
-      update: {
-        selectedOptions,
-        isCorrect,
-        responseTimeMs,
-      },
-      create: {
+    });
+
+    if (existingAnswer) {
+      // Calculate delta to prevent score inflation on duplicate updates
+      const oldScore = existingAnswer.isCorrect ? 1 : 0;
+      const newScore = isCorrect ? 1 : 0;
+      const deltaScore = newScore - oldScore;
+
+      // Update existing record
+      const updated = await this.prisma.pollAnswer.update({
+        where: { id: existingAnswer.id },
+        data: {
+          selectedOptions,
+          isCorrect,
+          responseTimeMs,
+        },
+      });
+
+      if (deltaScore !== 0) {
+        await this.prisma.sessionParticipant.update({
+          where: {
+            sessionId_userId: { sessionId: poll.sessionId, userId },
+          },
+          data: {
+            score: { increment: deltaScore },
+            totalCorrect: { increment: deltaScore },
+          },
+        });
+      }
+
+      return updated;
+    }
+
+    // First time answering this question
+    const answer = await this.prisma.pollAnswer.create({
+      data: {
         pollInstanceId,
         userId,
         telegramPollId: poll.telegramPollId,
@@ -193,7 +231,6 @@ export class SessionsService {
       },
     });
 
-    // Update participant score
     await this.prisma.sessionParticipant.upsert({
       where: {
         sessionId_userId: { sessionId: poll.sessionId, userId },
