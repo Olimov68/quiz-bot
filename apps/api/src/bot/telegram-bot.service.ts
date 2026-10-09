@@ -60,6 +60,20 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
           onStart: async (botInfo) => {
             this.logger.log(`✅ Telegram bot muvaffaqiyatli ulandi: @${botInfo.username}`);
             await this.recoverActiveSessions();
+            if (this.config.publicWebUrl?.startsWith('https://')) {
+              try {
+                await this.bot?.api.setChatMenuButton({
+                  menu_button: {
+                    type: 'web_app',
+                    text: '📱 Mini App',
+                    web_app: { url: this.config.publicWebUrl },
+                  },
+                });
+                this.logger.log('📱 Telegram Chat Menu Button (Mini App) muvaffaqiyatli sozlandi');
+              } catch (e: any) {
+                this.logger.warn(`Menu button sozlashda xatolik: ${e.message}`);
+              }
+            }
           },
         });
       } else {
@@ -84,6 +98,14 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
 
   public getBot(): Bot | null {
     return this.bot;
+  }
+
+  private getWebDashboardUrl(subPath = ''): { isHttps: boolean; url: string } {
+    const raw = (this.config.publicWebUrl || '').trim();
+    const cleanBase = raw.endsWith('/') ? raw.slice(0, -1) : raw;
+    const fullUrl = subPath ? `${cleanBase}${subPath.startsWith('/') ? '' : '/'}${subPath}` : cleanBase;
+    const isHttps = fullUrl.startsWith('https://');
+    return { isHttps, url: fullUrl };
   }
 
   /**
@@ -156,6 +178,8 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         return;
       }
 
+      const { isHttps, url: webUrl } = this.getWebDashboardUrl();
+
       const mainKeyboard = new Keyboard()
         .text(UZ_MENUS.CREATE_QUIZ)
         .text(UZ_MENUS.MY_QUIZZES)
@@ -165,24 +189,37 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         .row()
         .text(UZ_MENUS.STATISTICS)
         .text(UZ_MENUS.PROFILE)
-        .row()
-        .text(UZ_MENUS.SETTINGS)
-        .text(UZ_MENUS.HELP)
-        .resized();
+        .row();
 
-      const inlineKeyboard = new InlineKeyboard().webApp(
-        '🌐 Veb Panelni Ochish',
-        this.config.publicWebUrl
-      );
+      if (isHttps) {
+        mainKeyboard.webApp(UZ_MENUS.OPEN_DASHBOARD, webUrl);
+      } else {
+        mainKeyboard.text(UZ_MENUS.OPEN_DASHBOARD);
+      }
+
+      mainKeyboard.text(UZ_MENUS.HELP).resized();
 
       await ctx.reply(UZ_MESSAGES.WELCOME(from.first_name), {
         parse_mode: 'HTML',
         reply_markup: mainKeyboard,
       });
 
-      await ctx.reply('Quyidagi tugma orqali boshqaruv paneliga to‘g‘ridan-to‘g‘ri kirishingiz mumkin:', {
-        reply_markup: inlineKeyboard,
-      });
+      const inlineKeyboard = new InlineKeyboard();
+      if (isHttps) {
+        inlineKeyboard.webApp('🌐 Veb Panelni Ochish (Mini App)', webUrl);
+        await ctx.reply('Quyidagi tugma orqali boshqaruv paneliga to‘g‘ridan-to‘g‘ri kirishingiz mumkin:', {
+          reply_markup: inlineKeyboard,
+        });
+      } else {
+        inlineKeyboard.text('ℹ️ Mini App haqida ma’lumot', 'info_mini_app');
+        await ctx.reply(
+          `💡 <b>Telegram Mini App haqida:</b>\nTelegram qoidasiga ko‘ra, Mini App faqat <b>HTTPS</b> domen orqali ochiladi.\n\nServeringizga domen ulab, <code>.env</code> faylida:\n<code>PUBLIC_WEB_URL=https://sizning-domeningiz.uz</code>\nsozlanganida, ushbu tugma to‘liq ekranli Mini Appni ochadi.\n\nHozirgi manzil: <code>${webUrl || 'sozlanmagan'}</code>`,
+          {
+            parse_mode: 'HTML',
+            reply_markup: inlineKeyboard,
+          }
+        );
+      }
     });
 
     // 2. /help command
@@ -227,6 +264,38 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
 
     this.bot.hears(UZ_MENUS.HELP, async (ctx) => {
       await ctx.reply(UZ_MESSAGES.HELP, { parse_mode: 'HTML' });
+    });
+
+    this.bot.hears(UZ_MENUS.OPEN_DASHBOARD, async (ctx) => {
+      const { isHttps, url } = this.getWebDashboardUrl();
+      if (isHttps) {
+        const kb = new InlineKeyboard().webApp('🌐 Mini Appni Ochish', url);
+        await ctx.reply('Boshqaruv paneliga kirish uchun quyidagi tugmani bosing:', { reply_markup: kb });
+      } else {
+        const kb = new InlineKeyboard().text('ℹ️ Mini Appni qanday yoqish mumkin?', 'info_mini_app');
+        await ctx.reply(
+          '📱 <b>Telegram Mini App haqida:</b>\n\n' +
+          'Telegram xavfsizlik talablariga ko‘ra, Mini App faqat <b>HTTPS</b> xavfsiz protokoli orqali ishlaydi.\n\n' +
+          'Serveringizga domen ulab, <code>.env</code> faylida:\n' +
+          '<code>PUBLIC_WEB_URL=https://sizning-domeningiz.uz</code>\n' +
+          'deb sozlaganingizda, ushbu tugma bevosita Telegram ichida to‘liq ekranli Mini Appni ochadi.\n\n' +
+          `Hozirgi serverdagi manzil: <code>${url || 'sozlanmagan'}</code>`,
+          { parse_mode: 'HTML', reply_markup: kb }
+        );
+      }
+    });
+
+    this.bot.callbackQuery('info_mini_app', async (ctx) => {
+      await ctx.answerCallbackQuery();
+      await ctx.reply(
+        '📱 <b>Mini Appni ulash tartibi:</b>\n\n' +
+        '1. Serveringizga domen (masalan: <code>quiz.sizning-sayt.uz</code>) va SSL (Certbot HTTPS) o‘rnating.\n' +
+        '2. <code>/opt/quiz-bot/.env</code> faylida:\n' +
+        '   <code>PUBLIC_WEB_URL="https://quiz.sizning-sayt.uz"</code> deb yozing.\n' +
+        '3. Botni qayta ishga tushiring: <code>sudo systemctl restart quizbot</code>.\n\n' +
+        'Shundan so‘ng botda doimiy <b>«Mini App»</b> tugmasi paydo bo‘ladi va veb-panel to‘g‘ridan-to‘g‘ri Telegram ichida ochiladi!',
+        { parse_mode: 'HTML' }
+      );
     });
 
     // 5. Document upload handler (Word .docx files)
@@ -1086,9 +1155,13 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       leaderboard
     );
 
-    const keyboard = new InlineKeyboard()
-      .text('📥 Excel Hisobot', `excel_report_${session.id}`)
-      .webApp('🌐 Veb Natijalar', `${this.config.publicWebUrl}/dashboard/sessions/${session.id}`);
+    const { isHttps, url: webResultsUrl } = this.getWebDashboardUrl(`/dashboard/sessions/${session.id}`);
+    const keyboard = new InlineKeyboard().text('📥 Excel Hisobot', `excel_report_${session.id}`);
+    if (isHttps) {
+      keyboard.webApp('🌐 Veb Natijalar', webResultsUrl);
+    } else if (webResultsUrl && !webResultsUrl.includes('localhost')) {
+      keyboard.url('🌐 Veb Natijalar', webResultsUrl);
+    }
 
     await this.bot.api.sendMessage(Number(session.telegramChatId), leaderboardMsg, {
       parse_mode: 'HTML',
