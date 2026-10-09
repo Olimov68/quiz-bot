@@ -28,6 +28,10 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
   private bot: Bot | null = null;
   private config: AppConfig;
   private userStates = new Map<string, { step: string; data?: any }>();
+  private userSettings = new Map<
+    string,
+    { timeLimitSeconds: number; shuffleQuestions: boolean; shuffleOptions: boolean; showExplanation: boolean }
+  >();
   private activeTimers = new Map<string, NodeJS.Timeout>();
 
   constructor(
@@ -60,20 +64,6 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
           onStart: async (botInfo) => {
             this.logger.log(`✅ Telegram bot muvaffaqiyatli ulandi: @${botInfo.username}`);
             await this.recoverActiveSessions();
-            if (this.config.publicWebUrl?.startsWith('https://')) {
-              try {
-                await this.bot?.api.setChatMenuButton({
-                  menu_button: {
-                    type: 'web_app',
-                    text: '📱 Mini App',
-                    web_app: { url: this.config.publicWebUrl },
-                  },
-                });
-                this.logger.log('📱 Telegram Chat Menu Button (Mini App) muvaffaqiyatli sozlandi');
-              } catch (e: any) {
-                this.logger.warn(`Menu button sozlashda xatolik: ${e.message}`);
-              }
-            }
           },
         });
       } else {
@@ -98,14 +88,6 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
 
   public getBot(): Bot | null {
     return this.bot;
-  }
-
-  private getWebDashboardUrl(subPath = ''): { isHttps: boolean; url: string } {
-    const raw = (this.config.publicWebUrl || '').trim();
-    const cleanBase = raw.endsWith('/') ? raw.slice(0, -1) : raw;
-    const fullUrl = subPath ? `${cleanBase}${subPath.startsWith('/') ? '' : '/'}${subPath}` : cleanBase;
-    const isHttps = fullUrl.startsWith('https://');
-    return { isHttps, url: fullUrl };
   }
 
   /**
@@ -172,13 +154,15 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       const user = await this.upsertTelegramUser(from);
       const text = ctx.match;
 
-      if (text && text.startsWith('quiz_')) {
-        const quizId = text.replace('quiz_', '');
-        await this.handleIndividualQuizStart(ctx, user, quizId);
+      if (text && (text.startsWith('quiz_') || text.startsWith('startquiz_'))) {
+        const quizId = text.replace('quiz_', '').replace('startquiz_', '');
+        if (ctx.chat.type === 'group' || ctx.chat.type === 'supergroup') {
+          await this.handleStartQuizInGroup(ctx, quizId);
+        } else {
+          await this.handleIndividualQuizStart(ctx, user, quizId);
+        }
         return;
       }
-
-      const { isHttps, url: webUrl } = this.getWebDashboardUrl();
 
       const mainKeyboard = new Keyboard()
         .text(UZ_MENUS.CREATE_QUIZ)
@@ -189,57 +173,60 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         .row()
         .text(UZ_MENUS.STATISTICS)
         .text(UZ_MENUS.PROFILE)
-        .row();
-
-      if (isHttps) {
-        mainKeyboard.webApp(UZ_MENUS.OPEN_DASHBOARD, webUrl);
-      } else {
-        mainKeyboard.text(UZ_MENUS.OPEN_DASHBOARD);
-      }
-
-      mainKeyboard.text(UZ_MENUS.HELP).resized();
+        .row()
+        .text(UZ_MENUS.SETTINGS)
+        .text(UZ_MENUS.HELP)
+        .resized();
 
       await ctx.reply(UZ_MESSAGES.WELCOME(from.first_name), {
         parse_mode: 'HTML',
         reply_markup: mainKeyboard,
       });
+    });
 
-      const inlineKeyboard = new InlineKeyboard();
-      if (isHttps) {
-        inlineKeyboard.webApp('🌐 Veb Panelni Ochish (Mini App)', webUrl);
-        await ctx.reply('Quyidagi tugma orqali boshqaruv paneliga to‘g‘ridan-to‘g‘ri kirishingiz mumkin:', {
-          reply_markup: inlineKeyboard,
-        });
-      } else {
-        inlineKeyboard.text('ℹ️ Mini App haqida ma’lumot', 'info_mini_app');
+    // 2. /startquiz command for group testing
+    this.bot.command('startquiz', async (ctx) => {
+      const match = ctx.match?.trim();
+      if (!match) {
         await ctx.reply(
-          `💡 <b>Telegram Mini App haqida:</b>\nTelegram qoidasiga ko‘ra, Mini App faqat <b>HTTPS</b> domen orqali ochiladi.\n\nServeringizga domen ulab, <code>.env</code> faylida:\n<code>PUBLIC_WEB_URL=https://sizning-domeningiz.uz</code>\nsozlanganida, ushbu tugma to‘liq ekranli Mini Appni ochadi.\n\nHozirgi manzil: <code>${webUrl || 'sozlanmagan'}</code>`,
-          {
-            parse_mode: 'HTML',
-            reply_markup: inlineKeyboard,
-          }
+          '⚠️ <b>Guruhda test boshlash:</b>\n\n' +
+          'Test ID raqamini ko‘rsating:\n' +
+          '<code>/startquiz &lt;test_id&gt;</code>\n\n' +
+          '<i>Yoki «📚 Testlarim» bo‘limiga kirib test ostidagi «🚀 Guruhda boshlash» tugmasini bosing.</i>',
+          { parse_mode: 'HTML' }
         );
+        return;
       }
+      await this.handleStartQuizInGroup(ctx, match);
     });
 
-    // 2. /help command
+    // 3. /help command
     this.bot.command('help', async (ctx) => {
-      await ctx.reply(UZ_MESSAGES.HELP, { parse_mode: 'HTML' });
+      await this.showUserHelp(ctx);
     });
 
-    // 3. /cancel command
+    // 4. /cancel command
     this.bot.command('cancel', async (ctx) => {
       if (ctx.from) {
         this.userStates.delete(ctx.from.id.toString());
       }
-      await ctx.reply(UZ_MESSAGES.OPERATION_CANCELLED);
+      await ctx.reply('❌ Amal bekor qilindi. Bosh menyudasiz.');
     });
 
-    // 4. Menu Buttons
+    // 5. Menu Buttons
     this.bot.hears(UZ_MENUS.CREATE_QUIZ, async (ctx) => {
       if (!ctx.from) return;
-      this.userStates.set(ctx.from.id.toString(), { step: 'awaiting_quiz_title' });
-      await ctx.reply(UZ_MESSAGES.CREATE_TITLE_PROMPT, { parse_mode: 'HTML' });
+      this.userStates.set(ctx.from.id.toString(), {
+        step: 'awaiting_quiz_title',
+        data: { questions: [] },
+      });
+      await ctx.reply(
+        '📝 <b>Yangi test yaratish</b>\n\n' +
+        'Test mavzusini (nomini) kiriting:\n' +
+        '<i>Masalan: 8-sinf Kimyo — Davriy qonun</i>\n\n' +
+        '❌ <i>Bekor qilish uchun: /cancel</i>',
+        { parse_mode: 'HTML' }
+      );
     });
 
     this.bot.hears(UZ_MENUS.MY_QUIZZES, async (ctx) => {
@@ -252,6 +239,11 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       await this.showUserResults(ctx);
     });
 
+    this.bot.hears(UZ_MENUS.MY_GROUPS, async (ctx) => {
+      if (!ctx.from) return;
+      await this.showUserGroups(ctx);
+    });
+
     this.bot.hears(UZ_MENUS.STATISTICS, async (ctx) => {
       if (!ctx.from) return;
       await this.showUserStats(ctx);
@@ -262,40 +254,14 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       await this.showUserProfile(ctx);
     });
 
+    this.bot.hears(UZ_MENUS.SETTINGS, async (ctx) => {
+      if (!ctx.from) return;
+      await this.showUserSettings(ctx);
+    });
+
     this.bot.hears(UZ_MENUS.HELP, async (ctx) => {
-      await ctx.reply(UZ_MESSAGES.HELP, { parse_mode: 'HTML' });
-    });
-
-    this.bot.hears(UZ_MENUS.OPEN_DASHBOARD, async (ctx) => {
-      const { isHttps, url } = this.getWebDashboardUrl();
-      if (isHttps) {
-        const kb = new InlineKeyboard().webApp('🌐 Mini Appni Ochish', url);
-        await ctx.reply('Boshqaruv paneliga kirish uchun quyidagi tugmani bosing:', { reply_markup: kb });
-      } else {
-        const kb = new InlineKeyboard().text('ℹ️ Mini Appni qanday yoqish mumkin?', 'info_mini_app');
-        await ctx.reply(
-          '📱 <b>Telegram Mini App haqida:</b>\n\n' +
-          'Telegram xavfsizlik talablariga ko‘ra, Mini App faqat <b>HTTPS</b> xavfsiz protokoli orqali ishlaydi.\n\n' +
-          'Serveringizga domen ulab, <code>.env</code> faylida:\n' +
-          '<code>PUBLIC_WEB_URL=https://sizning-domeningiz.uz</code>\n' +
-          'deb sozlaganingizda, ushbu tugma bevosita Telegram ichida to‘liq ekranli Mini Appni ochadi.\n\n' +
-          `Hozirgi serverdagi manzil: <code>${url || 'sozlanmagan'}</code>`,
-          { parse_mode: 'HTML', reply_markup: kb }
-        );
-      }
-    });
-
-    this.bot.callbackQuery('info_mini_app', async (ctx) => {
-      await ctx.answerCallbackQuery();
-      await ctx.reply(
-        '📱 <b>Mini Appni ulash tartibi:</b>\n\n' +
-        '1. Serveringizga domen (masalan: <code>quiz.sizning-sayt.uz</code>) va SSL (Certbot HTTPS) o‘rnating.\n' +
-        '2. <code>/opt/quiz-bot/.env</code> faylida:\n' +
-        '   <code>PUBLIC_WEB_URL="https://quiz.sizning-sayt.uz"</code> deb yozing.\n' +
-        '3. Botni qayta ishga tushiring: <code>sudo systemctl restart quizbot</code>.\n\n' +
-        'Shundan so‘ng botda doimiy <b>«Mini App»</b> tugmasi paydo bo‘ladi va veb-panel to‘g‘ridan-to‘g‘ri Telegram ichida ochiladi!',
-        { parse_mode: 'HTML' }
-      );
+      if (!ctx.from) return;
+      await this.showUserHelp(ctx);
     });
 
     // 5. Document upload handler (Word .docx files)
@@ -456,7 +422,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       }
     });
 
-    // 6. Text message router
+    // 6. Text message router for manual question-by-question creation
     this.bot.on('message:text', async (ctx) => {
       const from = ctx.from;
       if (!from) return;
@@ -465,11 +431,77 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
 
       if (state.step === 'awaiting_quiz_title') {
         const title = ctx.message.text.trim();
-        this.userStates.set(from.id.toString(), {
-          step: 'awaiting_docx_file',
-          data: { title },
+        if (title.length < 2) {
+          await ctx.reply('❌ Test nomi juda qisqa. Qayta kiriting:');
+          return;
+        }
+        state.data = state.data || { questions: [] };
+        state.data.title = title;
+        state.step = 'awaiting_question_text';
+        await ctx.reply(
+          `✅ Test nomi: <b>${title}</b>\n\n` +
+          `Endi <b>1-savol matnini</b> kiriting:\n` +
+          `<i>Masalan: Suvning kimyoviy formulasi qaysi?</i>\n\n` +
+          `❌ <i>Bekor qilish uchun: /cancel</i>`,
+          { parse_mode: 'HTML' }
+        );
+        return;
+      }
+
+      if (state.step === 'awaiting_question_text') {
+        const qText = ctx.message.text.trim();
+        if (qText.length < 2) {
+          await ctx.reply('❌ Savol matni juda qisqa. Qayta kiriting:');
+          return;
+        }
+        state.data.currentQuestionText = qText;
+        state.step = 'awaiting_question_options';
+        const qNum = (state.data.questions?.length || 0) + 1;
+        await ctx.reply(
+          `❓ <b>${qNum}-savol:</b> ${qText}\n\n` +
+          `Endi ushbu savolning variantlarini yuboring (har bir variantni <b>yangi qatordan</b> yozing):\n\n` +
+          `<i>Namuna:\nA) H2O\nB) CO2\nC) O2\nD) NaCl</i>\n\n` +
+          `<i>(Kamida 2 ta variant)</i>`,
+          { parse_mode: 'HTML' }
+        );
+        return;
+      }
+
+      if (state.step === 'awaiting_question_options') {
+        const text = ctx.message.text.trim();
+        const rawLines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+        const cleaned = rawLines.map((l) => l.replace(/^[A-Za-z0-9][\)\.\-]\s*/, '').trim()).filter(Boolean);
+
+        if (cleaned.length < 2) {
+          await ctx.reply(
+            '❌ Kamida <b>2 ta variant</b> kiritishingiz kerak!\n\n' +
+            'Har bir variantni yangi qatordan yozib qayta yuboring:\n' +
+            '<i>A) Variant 1\nB) Variant 2\nC) Variant 3</i>',
+            { parse_mode: 'HTML' }
+          );
+          return;
+        }
+
+        if (cleaned.length > 10) {
+          await ctx.reply('❌ Variantlar soni ko‘pi bilan 10 ta bo‘lishi mumkin. Qayta yuboring:');
+          return;
+        }
+
+        state.data.currentOptions = cleaned;
+        state.step = 'awaiting_correct_option';
+
+        const kb = new InlineKeyboard();
+        cleaned.forEach((opt, idx) => {
+          const letter = String.fromCharCode(65 + idx);
+          kb.text(`${letter}) ${opt.slice(0, 30)}`, `set_correct_${idx}`).row();
         });
-        await ctx.reply(UZ_MESSAGES.CREATE_FILE_PROMPT, { parse_mode: 'HTML' });
+
+        await ctx.reply(
+          `❓ Savol: <b>${state.data.currentQuestionText}</b>\n\n` +
+          `Quyidagi variantlardan <b>to‘g‘ri javobni</b> tanlang:`,
+          { parse_mode: 'HTML', reply_markup: kb }
+        );
+        return;
       }
     });
 
@@ -478,6 +510,229 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       const data = ctx.callbackQuery.data;
       const user = await this.upsertTelegramUser(ctx.from);
 
+      // --- Manual Question Flow Callbacks ---
+      if (data.startsWith('set_correct_')) {
+        const optIdx = parseInt(data.replace('set_correct_', ''), 10);
+        const fromId = ctx.from.id.toString();
+        const state = this.userStates.get(fromId);
+
+        if (!state || !state.data?.currentQuestionText || !state.data?.currentOptions) {
+          await ctx.answerCallbackQuery({ text: 'Eski yoki bekor qilingan amal.' });
+          return;
+        }
+
+        const qText = state.data.currentQuestionText;
+        const options = state.data.currentOptions.map((optText: string, idx: number) => ({
+          text: optText,
+          isCorrect: idx === optIdx,
+        }));
+
+        state.data.questions = state.data.questions || [];
+        state.data.questions.push({ text: qText, options });
+        delete state.data.currentQuestionText;
+        delete state.data.currentOptions;
+        state.step = 'awaiting_next_action';
+
+        await ctx.answerCallbackQuery({ text: 'To‘g‘ri javob tanlandi! ✅' });
+
+        const count = state.data.questions.length;
+        const correctLetter = String.fromCharCode(65 + optIdx);
+        const correctText = options[optIdx].text;
+
+        const actionKb = new InlineKeyboard()
+          .text('➕ Keyingi savolni qo‘shish', 'manual_add_next')
+          .row()
+          .text('🏁 Testni yakunlash va saqlash', 'manual_finish_quiz')
+          .row()
+          .text('❌ Bekor qilish', 'manual_cancel_quiz');
+
+        await ctx.reply(
+          `✅ <b>${count}-savol saqlandi!</b>\n\n` +
+          `📝 <b>Savol:</b> ${qText}\n` +
+          `🎯 <b>To‘g‘ri javob:</b> ${correctLetter}) ${correctText}\n\n` +
+          `Jami kiritilgan savollar: <b>${count} ta</b>\n\n` +
+          `Yana savol qo‘shasizmi yoki testni saqlaysizmi?`,
+          { parse_mode: 'HTML', reply_markup: actionKb }
+        );
+        return;
+      }
+
+      if (data === 'manual_add_next') {
+        const fromId = ctx.from.id.toString();
+        const state = this.userStates.get(fromId);
+        if (!state) {
+          await ctx.answerCallbackQuery({ text: 'Amal topilmadi.' });
+          return;
+        }
+        await ctx.answerCallbackQuery();
+        state.step = 'awaiting_question_text';
+        const nextNum = (state.data?.questions?.length || 0) + 1;
+        await ctx.reply(
+          `📝 <b>${nextNum}-savol matnini</b> kiriting:\n\n` +
+          `❌ <i>Bekor qilish uchun: /cancel</i>`,
+          { parse_mode: 'HTML' }
+        );
+        return;
+      }
+
+      if (data === 'manual_finish_quiz') {
+        const fromId = ctx.from.id.toString();
+        const state = this.userStates.get(fromId);
+        if (!state || !state.data?.questions || state.data.questions.length === 0) {
+          await ctx.answerCallbackQuery({ text: 'Kamida 1 ta savol kiritishingiz shart!', show_alert: true });
+          return;
+        }
+
+        await ctx.answerCallbackQuery({ text: 'Test saqlanmoqda... ⏳' });
+
+        const quizTitle = state.data.title || 'Yangi test';
+        const questions = state.data.questions;
+        const settings = this.getUserSettings(fromId);
+
+        const quiz = await this.prisma.quiz.create({
+          data: {
+            title: quizTitle,
+            creatorId: user.id,
+            status: QuizStatus.PUBLISHED,
+            currentVersion: 1,
+            settings: {
+              timeLimitPerQuestionSeconds: settings.timeLimitSeconds,
+              shuffleQuestions: settings.shuffleQuestions,
+              shuffleOptions: settings.shuffleOptions,
+              showExplanation: settings.showExplanation,
+            },
+            versions: {
+              create: {
+                versionNumber: 1,
+                title: quizTitle,
+                questions: {
+                  create: questions.map((q: any, idx: number) => ({
+                    questionIndex: idx + 1,
+                    text: q.text,
+                    points: 1,
+                    options: {
+                      create: q.options.map((opt: any, optIdx: number) => ({
+                        optionIndex: optIdx,
+                        text: opt.text,
+                        isCorrect: opt.isCorrect,
+                      })),
+                    },
+                  })),
+                },
+              },
+            },
+          },
+        });
+
+        this.userStates.delete(fromId);
+
+        const kb = new InlineKeyboard()
+          .text('🚀 Guruhda boshlash', `start_group_${quiz.id}`)
+          .row()
+          .text('📋 Savollarni ko‘rish', `view_quiz_${quiz.id}`)
+          .row()
+          .text('📚 Barcha testlarim', 'menu_my_quizzes');
+
+        await ctx.reply(
+          `🎉 <b>«${quizTitle}» testi muvaffaqiyatli saqlandi!</b>\n\n` +
+          `📝 <b>Jami savollar:</b> ${questions.length} ta\n` +
+          `⏱ <b>Savol vaqti:</b> ${settings.timeLimitSeconds > 0 ? settings.timeLimitSeconds + ' soniya' : 'Cheklovsiz'}\n\n` +
+          `Endi ushbu testni guruhingizda o‘tkazishingiz mumkin:`,
+          { parse_mode: 'HTML', reply_markup: kb }
+        );
+        return;
+      }
+
+      if (data === 'manual_cancel_quiz') {
+        this.userStates.delete(ctx.from.id.toString());
+        await ctx.answerCallbackQuery({ text: 'Bekor qilindi' });
+        await ctx.reply('❌ Test yaratish bekor qilindi. Bosh menyudasiz.');
+        return;
+      }
+
+      // --- Quiz Actions ---
+      if (data.startsWith('view_quiz_')) {
+        const quizId = data.replace('view_quiz_', '');
+        await ctx.answerCallbackQuery();
+        await this.showQuizQuestions(ctx, quizId);
+        return;
+      }
+
+      if (data.startsWith('confirm_delete_quiz_')) {
+        const quizId = data.replace('confirm_delete_quiz_', '');
+        await ctx.answerCallbackQuery();
+        const kb = new InlineKeyboard()
+          .text('🗑 Ha, o‘chirish', `do_delete_quiz_${quizId}`)
+          .text('❌ Bekor qilish', 'cancel_delete_quiz');
+        await ctx.reply('⚠️ <b>Ushbu testni butunlay o‘chirib tashlamoqchimisiz?</b>', {
+          parse_mode: 'HTML',
+          reply_markup: kb,
+        });
+        return;
+      }
+
+      if (data.startsWith('do_delete_quiz_')) {
+        const quizId = data.replace('do_delete_quiz_', '');
+        await this.prisma.quiz.deleteMany({
+          where: { id: quizId, creatorId: user.id },
+        });
+        await ctx.answerCallbackQuery({ text: 'Test o‘chirildi ✅' });
+        await ctx.reply('✅ Test muvaffaqiyatli o‘chirildi.');
+        return;
+      }
+
+      if (data === 'cancel_delete_quiz') {
+        await ctx.answerCallbackQuery({ text: 'Bekor qilindi' });
+        await ctx.reply('O‘chirish bekor qilindi.');
+        return;
+      }
+
+      if (data === 'menu_my_quizzes') {
+        await ctx.answerCallbackQuery();
+        await this.showUserQuizzes(ctx);
+        return;
+      }
+
+      // --- Settings Toggles ---
+      if (data === 'toggle_setting_time') {
+        const fromId = ctx.from.id.toString();
+        const s = this.getUserSettings(fromId);
+        const times = [15, 30, 45, 60, 0];
+        const curIdx = times.indexOf(s.timeLimitSeconds);
+        s.timeLimitSeconds = times[(curIdx + 1) % times.length];
+        await ctx.answerCallbackQuery({ text: `Vaqt: ${s.timeLimitSeconds === 0 ? 'Vaqtsiz' : s.timeLimitSeconds + 's'}` });
+        await this.showUserSettings(ctx);
+        return;
+      }
+
+      if (data === 'toggle_setting_shuffle_q') {
+        const fromId = ctx.from.id.toString();
+        const s = this.getUserSettings(fromId);
+        s.shuffleQuestions = !s.shuffleQuestions;
+        await ctx.answerCallbackQuery({ text: s.shuffleQuestions ? 'Aralashtirish yoqildi' : 'O‘chirildi' });
+        await this.showUserSettings(ctx);
+        return;
+      }
+
+      if (data === 'toggle_setting_shuffle_o') {
+        const fromId = ctx.from.id.toString();
+        const s = this.getUserSettings(fromId);
+        s.shuffleOptions = !s.shuffleOptions;
+        await ctx.answerCallbackQuery({ text: s.shuffleOptions ? 'Variantlar aralashtiriladi' : 'O‘chirildi' });
+        await this.showUserSettings(ctx);
+        return;
+      }
+
+      if (data === 'toggle_setting_expl') {
+        const fromId = ctx.from.id.toString();
+        const s = this.getUserSettings(fromId);
+        s.showExplanation = !s.showExplanation;
+        await ctx.answerCallbackQuery({ text: s.showExplanation ? 'Izohlar ko‘rsatiladi' : 'O‘chirildi' });
+        await this.showUserSettings(ctx);
+        return;
+      }
+
+      // --- Session Running Callbacks ---
       if (data.startsWith('join_session_')) {
         const sessionId = data.replace('join_session_', '');
         await this.handleJoinSession(ctx, user, sessionId);
@@ -545,7 +800,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     const quizzes = await this.prisma.quiz.findMany({
       where: { creatorId: user.id },
       orderBy: { createdAt: 'desc' },
-      take: 10,
+      take: 15,
       include: {
         versions: {
           take: 1,
@@ -557,21 +812,74 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
 
     if (quizzes.length === 0) {
       await ctx.reply(
-        `📚 Sizda hali yaratilgan testlar mavjud emas.\n\n«➕ Test yaratish» tugmasini bosib birinchi testingizni yarating!`
+        `📚 <b>Sizda hali testlar mavjud emas.</b>\n\n` +
+        `«➕ Test yaratish» tugmasini bosib birinchi testingizni yarating!`,
+        { parse_mode: 'HTML' }
       );
       return;
     }
 
-    let text = `📚 <b>Sizning testlaringiz:</b>\n\n`;
+    let text = `📚 <b>Siz yaratgan testlar:</b>\n\n`;
     const keyboard = new InlineKeyboard();
 
     quizzes.forEach((q, idx) => {
       const qCount = q.versions[0]?._count?.questions || 0;
       text += `${idx + 1}. <b>${q.title}</b> (${qCount} ta savol)\n`;
-      keyboard.text(`🚀 ${q.title.slice(0, 20)}`, `start_group_${q.id}`).row();
+      keyboard
+        .text(`🚀 Boshlash`, `start_group_${q.id}`)
+        .text(`📋 Savollar (${qCount})`, `view_quiz_${q.id}`)
+        .text(`🗑`, `confirm_delete_quiz_${q.id}`)
+        .row();
     });
 
     await ctx.reply(text, { parse_mode: 'HTML', reply_markup: keyboard });
+  }
+
+  private async showQuizQuestions(ctx: any, quizId: string) {
+    const quiz = await this.prisma.quiz.findUnique({
+      where: { id: quizId },
+      include: {
+        versions: {
+          take: 1,
+          orderBy: { versionNumber: 'desc' },
+          include: {
+            questions: {
+              orderBy: { questionIndex: 'asc' },
+              include: { options: { orderBy: { optionIndex: 'asc' } } },
+            },
+          },
+        },
+      },
+    });
+
+    if (!quiz || quiz.versions.length === 0) {
+      await ctx.reply('❌ Test topilmadi.');
+      return;
+    }
+
+    const version = quiz.versions[0];
+    let msg = `📋 <b>«${quiz.title}» testi savollari:</b>\n\n`;
+
+    if (version.questions.length === 0) {
+      msg += `<i>Ushbu testda hali savollar mavjud emas.</i>`;
+    } else {
+      version.questions.forEach((q) => {
+        msg += `<b>${q.questionIndex}. ${q.text}</b>\n`;
+        q.options.forEach((opt) => {
+          const letter = String.fromCharCode(65 + opt.optionIndex);
+          const icon = opt.isCorrect ? '✅' : '⚪️';
+          msg += `   ${icon} ${letter}) ${opt.text}\n`;
+        });
+        msg += '\n';
+      });
+    }
+
+    const kb = new InlineKeyboard()
+      .text('🚀 Guruhda boshlash', `start_group_${quiz.id}`)
+      .row()
+      .text('🗑 Testni o‘chirish', `confirm_delete_quiz_${quiz.id}`);
+
+    await ctx.reply(msg, { parse_mode: 'HTML', reply_markup: kb });
   }
 
   private async showUserResults(ctx: any) {
@@ -579,84 +887,223 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     const sessions = await this.prisma.quizSession.findMany({
       where: { createdById: user.id },
       orderBy: { createdAt: 'desc' },
-      take: 5,
+      take: 8,
       include: {
+        group: true,
         quizVersion: true,
         _count: { select: { participants: true } },
       },
     });
 
     if (sessions.length === 0) {
-      await ctx.reply('🏆 Sizda hali o‘tkazilgan test natijalari mavjud emas.');
+      await ctx.reply(
+        '🏆 <b>Sizda hali o‘tkazilgan test sessiyalari yo‘q.</b>\n\n' +
+        'Guruhlaringizda test boshlang, barcha natijalar va Excel hisobotlar shu yerda chiqadi!',
+        { parse_mode: 'HTML' }
+      );
       return;
     }
 
-    let text = `🏆 <b>Oxirgi o‘tkazilgan test sessiyalari:</b>\n\n`;
+    let text = `🏆 <b>Oxirgi o‘tkazilgan test natijalari:</b>\n\n`;
     const keyboard = new InlineKeyboard();
 
     sessions.forEach((s, idx) => {
-      text += `${idx + 1}. <b>${s.quizVersion.title}</b>\n`;
-      text += `   👥 Qatnashchilar: ${s._count.participants} ta | Holat: ${s.status}\n\n`;
-      keyboard.text(`📊 Hisobot #${idx + 1}`, `excel_report_${s.id}`).row();
+      const gTitle = s.group?.title || 'Guruh';
+      const dateStr = s.startedAt ? s.startedAt.toLocaleDateString('uz-UZ') : '';
+      text += `${idx + 1}. <b>${s.quizVersion.title}</b> (${gTitle})\n`;
+      text += `   👥 Qatnashchilar: ${s._count.participants} nafar | Sana: ${dateStr}\n\n`;
+      keyboard.text(`📥 Excel Hisobot (#${idx + 1})`, `excel_report_${s.id}`).row();
     });
 
     await ctx.reply(text, { parse_mode: 'HTML', reply_markup: keyboard });
   }
 
+  private async showUserGroups(ctx: any) {
+    const user = await this.upsertTelegramUser(ctx.from!);
+    const sessions = await this.prisma.quizSession.findMany({
+      where: { createdById: user.id, telegramChatId: { not: null } },
+      select: {
+        telegramChatId: true,
+        group: true,
+        quizVersion: { select: { title: true } },
+      },
+      distinct: ['telegramChatId'],
+      take: 10,
+    });
+
+    let text = `👥 <b>GURUHLAR BO‘LIMI</b>\n\n`;
+
+    if (sessions.length > 0) {
+      text += `<b>Siz test o‘tkazgan guruhlar:</b>\n`;
+      sessions.forEach((s, idx) => {
+        const title = s.group?.title || `Guruh (ID: ${s.telegramChatId})`;
+        text += `${idx + 1}. <b>${title}</b>\n`;
+      });
+      text += `\n`;
+    }
+
+    text +=
+      `<b>📌 Guruhda yangi test o‘tkazish:</b>\n\n` +
+      `1. Botni guruhingizga qo‘shing.\n` +
+      `2. Botga guruhda <b>Admin (Administrator)</b> huquqini bering (so‘rovnoma jo‘natishi uchun).\n` +
+      `3. «📚 Testlarim» bo‘limiga kiring va test ostidagi <b>«🚀 Boshlash»</b> tugmasini bosing.\n` +
+      `4. Guruhingizda <b>«✅ Tayyorman»</b> tugmali so‘rovnoma boshlanadi!`;
+
+    await ctx.reply(text, { parse_mode: 'HTML' });
+  }
+
   private async showUserStats(ctx: any) {
     const user = await this.upsertTelegramUser(ctx.from!);
-    const attempts = await this.prisma.quizAttempt.findMany({
-      where: { userId: user.id },
+
+    const quizzesCount = await this.prisma.quiz.count({ where: { creatorId: user.id } });
+
+    const userQuizzes = await this.prisma.quiz.findMany({
+      where: { creatorId: user.id },
+      include: {
+        versions: {
+          include: { _count: { select: { questions: true } } },
+        },
+      },
+    });
+    const totalQuestions = userQuizzes.reduce(
+      (sum, q) => sum + (q.versions[0]?._count?.questions || 0),
+      0
+    );
+
+    const totalSessions = await this.prisma.quizSession.count({ where: { createdById: user.id } });
+
+    const totalParticipants = await this.prisma.sessionParticipant.count({
+      where: { session: { createdById: user.id } },
     });
 
-    const quizzesCount = attempts.length;
-    const totalCorrect = attempts.reduce((acc, a) => acc + a.totalCorrect, 0);
-    const totalIncorrect = attempts.reduce((acc, a) => acc + a.totalIncorrect, 0);
-    const avgScore = quizzesCount > 0 ? attempts.reduce((acc, a) => acc + a.percentage, 0) / quizzesCount : 0;
-    const bestScore = quizzesCount > 0 ? Math.max(...attempts.map((a) => a.percentage)) : 0;
-
-    const text = UZ_MESSAGES.STUDENT_PROFILE({
-      name: ctx.from.first_name,
-      quizzesCount,
-      correctAnswers: totalCorrect,
-      wrongAnswers: totalIncorrect,
-      averageScore: avgScore,
-      bestScore,
+    const totalAnswers = await this.prisma.pollAnswer.count({
+      where: { pollInstance: { session: { createdById: user.id } } },
     });
+    const correctAnswers = await this.prisma.pollAnswer.count({
+      where: { pollInstance: { session: { createdById: user.id } }, isCorrect: true },
+    });
+    const accuracy = totalAnswers > 0 ? Math.round((correctAnswers / totalAnswers) * 100) : 0;
+
+    let text = `📊 <b>SMART QUIZ BOT — FOYDALANUVCHI STATISTIKASI</b>\n\n`;
+    text += `👤 <b>Foydalanuvchi:</b> ${ctx.from.first_name}\n\n`;
+    text += `📚 <b>Yaratilgan testlar:</b> ${quizzesCount} ta\n`;
+    text += `📝 <b>Jami savollar:</b> ${totalQuestions} ta\n`;
+    text += `🚀 <b>O‘tkazilgan guruh sessiyalari:</b> ${totalSessions} ta\n`;
+    text += `👥 <b>Testlarda qatnashgan o‘quvchilar:</b> ${totalParticipants} nafar\n`;
+    text += `🎯 <b>Berilgan jami javoblar:</b> ${totalAnswers} ta\n`;
+    text += `✅ <b>To‘g‘ri javoblar:</b> ${correctAnswers} ta (${accuracy}%)\n\n`;
+    text += `<i>💡 Guruhlaringizda ko‘proq test o‘tkazib o‘quvchilar bilimini mustahkamlang!</i>`;
 
     await ctx.reply(text, { parse_mode: 'HTML' });
   }
 
   private async showUserProfile(ctx: any) {
     const user = await this.upsertTelegramUser(ctx.from!);
-    let text = `👤 <b>Sizning profilingiz:</b>\n\n`;
-    text += `🆔 Telegram ID: <code>${user.telegramId}</code>\n`;
-    text += `👤 Ism: <b>${user.firstName} ${user.lastName || ''}</b>\n`;
-    if (user.username) text += `🔹 Username: @${user.username}\n`;
-    text += `🎖 Rol: <b>${user.role}</b>\n`;
+    const quizzesCount = await this.prisma.quiz.count({ where: { creatorId: user.id } });
+    const sessionsCount = await this.prisma.quizSession.count({ where: { createdById: user.id } });
 
-    const inlineKeyboard = new InlineKeyboard().webApp(
-      '🌐 Boshqaruv Panelini Ochish',
-      this.config.publicWebUrl
-    );
+    let text = `👤 <b>SIZNING PROFILINGIZ:</b>\n\n`;
+    text += `🆔 <b>Telegram ID:</b> <code>${user.telegramId}</code>\n`;
+    text += `👤 <b>Ism:</b> ${user.firstName} ${user.lastName || ''}\n`;
+    if (user.username) text += `🔹 <b>Username:</b> @${user.username}\n`;
+    text += `🎖 <b>Daraja:</b> ${user.role === UserRole.SUPER_ADMIN ? 'Super Admin 👑' : 'O‘qituvchi 👨‍🏫'}\n`;
+    text += `📅 <b>A’zolik sanasi:</b> ${user.createdAt.toLocaleDateString('uz-UZ')}\n\n`;
+    text += `📚 <b>Yaratgan testlaringiz:</b> ${quizzesCount} ta\n`;
+    text += `🏆 <b>O‘tkazgan sessiyalaringiz:</b> ${sessionsCount} ta\n`;
 
-    await ctx.reply(text, { parse_mode: 'HTML', reply_markup: inlineKeyboard });
+    await ctx.reply(text, { parse_mode: 'HTML' });
+  }
+
+  private getUserSettings(userId: string) {
+    let s = this.userSettings.get(userId);
+    if (!s) {
+      s = {
+        timeLimitSeconds: 30,
+        shuffleQuestions: true,
+        shuffleOptions: true,
+        showExplanation: true,
+      };
+      this.userSettings.set(userId, s);
+    }
+    return s;
+  }
+
+  private async showUserSettings(ctx: any) {
+    const fromId = ctx.from.id.toString();
+    const s = this.getUserSettings(fromId);
+
+    const timeLabel = s.timeLimitSeconds === 0 ? 'Vaqtsiz (0s)' : `${s.timeLimitSeconds} soniya`;
+    const shuffleQLab = s.shuffleQuestions ? '✅ Yoqilgan' : '❌ O‘chirilgan';
+    const shuffleOLab = s.shuffleOptions ? '✅ Yoqilgan' : '❌ O‘chirilgan';
+    const explLab = s.showExplanation ? '✅ Yoqilgan' : '❌ O‘chirilgan';
+
+    const kb = new InlineKeyboard()
+      .text(`⏱ Savol vaqti: ${timeLabel}`, 'toggle_setting_time')
+      .row()
+      .text(`🔀 Savollarni aralashtirish: ${shuffleQLab}`, 'toggle_setting_shuffle_q')
+      .row()
+      .text(`🔤 Variantlarni aralashtirish: ${shuffleOLab}`, 'toggle_setting_shuffle_o')
+      .row()
+      .text(`💡 To‘g‘ri javob izohi: ${explLab}`, 'toggle_setting_expl');
+
+    const text =
+      `⚙️ <b>TEST SOZLAMALARI:</b>\n\n` +
+      `Ushbu sozlamalar siz yaratadigan va guruhda boshlaydigan yangi testlarga standart qo‘llanadi.\n\n` +
+      `O‘zgartirish uchun kerakli tugmani bosing:`;
+
+    if (ctx.callbackQuery) {
+      try {
+        await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: kb });
+      } catch {
+        await ctx.reply(text, { parse_mode: 'HTML', reply_markup: kb });
+      }
+    } else {
+      await ctx.reply(text, { parse_mode: 'HTML', reply_markup: kb });
+    }
+  }
+
+  private async showUserHelp(ctx: any) {
+    const text =
+      `<b>📖 SMART QUIZ BOT — FOYDALANISH QO‘LLANMASI</b>\n\n` +
+      `<b>1. Yangi test yaratish:</b>\n` +
+      `• «➕ Test yaratish» tugmasini bosing.\n` +
+      `• Test mavzusini kiriting (masalan: <i>Organik kimyo</i>).\n` +
+      `• Savol matnini va variantlarni yangi qatorda yuboring.\n` +
+      `• Chiqqan tugmalardan to‘g‘ri javobni tanlang.\n` +
+      `• «➕ Keyingi savol» tugmasi orqali xohlagancha savol kiriting va «🏁 Testni yakunlash»ni bosing.\n\n` +
+      `<b>2. Guruhda jonli test o‘tkazish:</b>\n` +
+      `• Botni guruhingizga qo‘shib <b>Admin</b> qiling.\n` +
+      `• «📚 Testlarim» bo‘limidan test ostidagi «🚀 Boshlash» tugmasini bosing.\n` +
+      `• O‘quvchilar guruhdagi «✅ Tayyorman» tugmasi orqali qatnashadilar.\n\n` +
+      `<b>3. Natijalar va Excel hisobot:</b>\n` +
+      `• Test yakunlangach reyting jadvali va 3 varaqli Excel hisobot tayyorlanadi.\n` +
+      `• «🏆 Natijalar» bo‘limidan istalgan sessiya hisobotini yuklab olishingiz mumkin.`;
+
+    await ctx.reply(text, { parse_mode: 'HTML' });
   }
 
   private async promptStartGroupSession(ctx: any, quizId: string) {
     const quiz = await this.prisma.quiz.findUnique({
       where: { id: quizId },
-      include: { versions: { take: 1, orderBy: { versionNumber: 'desc' } } },
     });
     if (!quiz) return;
 
-    await ctx.answerCallbackQuery();
+    if (ctx.callbackQuery) {
+      await ctx.answerCallbackQuery();
+    }
+
+    const cleanUsername = (this.config.botUsername || 'quizbot').replace(/^@/, '');
+    const kb = new InlineKeyboard()
+      .url('👥 Guruhga qo‘shish va boshlash', `https://t.me/${cleanUsername}?startgroup=startquiz_${quiz.id}`)
+      .row()
+      .text('📋 Savollarni ko‘rish', `view_quiz_${quiz.id}`);
+
     await ctx.reply(
-      `📌 <b>Testni guruhda o‘tkazish uchun:</b>\n\n` +
-      `1. Botni guruhingizga qo‘shing va admin huquqini bering.\n` +
-      `2. Guruhingizda quyidagi buyruqni yuboring:\n\n` +
+      `🚀 <b>«${quiz.title}» testini guruhda boshlash:</b>\n\n` +
+      `<b>1-usul:</b> Quyidagi <b>«👥 Guruhga qo‘shish va boshlash»</b> tugmasini bosing va guruhingizni tanlang.\n\n` +
+      `<b>2-usul:</b> Agar bot allaqachon guruhingizda admin bo‘lsa, guruhingizda quyidagi buyruqni yuboring:\n` +
       `<code>/startquiz ${quiz.id}</code>`,
-      { parse_mode: 'HTML' }
+      { parse_mode: 'HTML', reply_markup: kb }
     );
   }
 
@@ -1155,13 +1602,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       leaderboard
     );
 
-    const { isHttps, url: webResultsUrl } = this.getWebDashboardUrl(`/dashboard/sessions/${session.id}`);
-    const keyboard = new InlineKeyboard().text('📥 Excel Hisobot', `excel_report_${session.id}`);
-    if (isHttps) {
-      keyboard.webApp('🌐 Veb Natijalar', webResultsUrl);
-    } else if (webResultsUrl && !webResultsUrl.includes('localhost')) {
-      keyboard.url('🌐 Veb Natijalar', webResultsUrl);
-    }
+    const keyboard = new InlineKeyboard().text('📥 Excel Hisobot yuklab olish', `excel_report_${session.id}`);
 
     await this.bot.api.sendMessage(Number(session.telegramChatId), leaderboardMsg, {
       parse_mode: 'HTML',
