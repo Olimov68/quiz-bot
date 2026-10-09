@@ -1,4 +1,5 @@
-import { getPrismaClient, UserRole, QuizStatus } from './index.js';
+import { getPrismaClient } from './index.js';
+import { UserRole, QuizStatus } from '@smart-quiz/shared';
 
 async function seed() {
   const prisma = getPrismaClient();

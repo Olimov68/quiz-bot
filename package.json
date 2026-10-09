@@ -21,6 +21,7 @@
     "db:seed": "npm run db:seed -w @smart-quiz/database",
     "test": "npm run test --workspaces --if-present",
     "test:unit": "npm run test:unit -w @smart-quiz/docx-parser && npm run test:unit -w @smart-quiz/quiz-engine",
+    "postinstall": "npm run db:generate",
     "lint": "npm run lint --workspaces --if-present"
   },
   "devDependencies": {
