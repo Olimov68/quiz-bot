@@ -1,0 +1,410 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum UserRole {
+  SUPER_ADMIN
+  TEACHER
+  STUDENT
+}
+
+enum QuizStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum QuizSessionMode {
+  LIVE_GROUP
+  INDIVIDUAL
+}
+
+enum SessionStatus {
+  PENDING
+  WAITING_PARTICIPANTS
+  ACTIVE
+  PAUSED
+  COMPLETED
+  CANCELLED
+}
+
+model User {
+  id          String   @id @default(uuid())
+  telegramId  BigInt   @unique
+  username    String?
+  firstName   String
+  lastName    String?
+  role        UserRole @default(TEACHER)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  teacherProfile      TeacherProfile?
+  studentProfile      StudentProfile?
+  quizzes             Quiz[]
+  createdSessions     QuizSession[]
+  sessionParticipants SessionParticipant[]
+  pollAnswers         PollAnswer[]
+  attempts            QuizAttempt[]
+  groupMemberships    GroupMembership[]
+  importJobs          ImportJob[]
+  exportJobs          ExportJob[]
+  auditLogs           AuditLog[]
+
+  @@index([telegramId])
+}
+
+model TeacherProfile {
+  id              String   @id @default(uuid())
+  userId          String   @unique
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  bio             String?
+  school          String?
+  subject         String?
+  quotaMaxQuizzes Int      @default(100)
+  createdAt       DateTime @default(now())
+}
+
+model StudentProfile {
+  id                  String   @id @default(uuid())
+  userId              String   @unique
+  user                User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  grade               String?
+  school              String?
+  totalQuizzesTaken   Int      @default(0)
+  totalCorrectAnswers Int      @default(0)
+  createdAt           DateTime @default(now())
+}
+
+model Group {
+  id             String            @id @default(uuid())
+  telegramChatId BigInt            @unique
+  title          String
+  type           String            @default("group")
+  ownerId        String?
+  createdAt      DateTime          @default(now())
+  memberships    GroupMembership[]
+  sessions       QuizSession[]
+
+  @@index([telegramChatId])
+}
+
+model GroupMembership {
+  id       String   @id @default(uuid())
+  groupId  String
+  group    Group    @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  userId   String
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role     String   @default("MEMBER")
+  joinedAt DateTime @default(now())
+
+  @@unique([groupId, userId])
+}
+
+model Quiz {
+  id             String        @id @default(uuid())
+  title          String
+  description    String?
+  creatorId      String
+  creator        User          @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  currentVersion Int           @default(1)
+  status         QuizStatus    @default(DRAFT)
+  settings       Json?
+  subject        String?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  versions       QuizVersion[]
+
+  @@index([creatorId])
+  @@index([status])
+}
+
+model QuizVersion {
+  id            String        @id @default(uuid())
+  quizId        String
+  quiz          Quiz          @relation(fields: [quizId], references: [id], onDelete: Cascade)
+  versionNumber Int
+  title         String
+  description   String?
+  settings      Json?
+  createdAt     DateTime      @default(now())
+  questions     Question[]
+  sessions      QuizSession[]
+  attempts      QuizAttempt[]
+
+  @@unique([quizId, versionNumber])
+  @@index([quizId])
+}
+
+model Question {
+  id                 String           @id @default(uuid())
+  quizVersionId      String
+  quizVersion        QuizVersion      @relation(fields: [quizVersionId], references: [id], onDelete: Cascade)
+  questionBankItemId String?
+  questionIndex      Int
+  text               String
+  textRaw            String?
+  explanation        String?
+  hasMath            Boolean          @default(false)
+  hasChemistry       Boolean          @default(false)
+  timeLimitSeconds   Int?
+  points             Int              @default(1)
+  createdAt          DateTime         @default(now())
+  options            QuestionOption[]
+  assets             QuestionAsset[]
+  pollInstances      PollInstance[]
+  attemptAnswers     AttemptAnswer[]
+
+  @@index([quizVersionId])
+}
+
+model QuestionOption {
+  id          String   @id @default(uuid())
+  questionId  String
+  question    Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  optionIndex Int
+  text        String
+  isCorrect   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  @@index([questionId])
+}
+
+model MediaAsset {
+  id           String          @id @default(uuid())
+  originalName String
+  fileName     String
+  mimeType     String
+  sizeBytes    Int
+  path         String
+  url          String?
+  ownerId      String?
+  createdAt    DateTime        @default(now())
+  assets       QuestionAsset[]
+}
+
+model QuestionAsset {
+  id           String     @id @default(uuid())
+  questionId   String
+  question     Question   @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  optionId     String?
+  mediaAssetId String
+  mediaAsset   MediaAsset @relation(fields: [mediaAssetId], references: [id], onDelete: Cascade)
+  assetType    String
+
+  @@index([questionId])
+}
+
+model QuestionBankItem {
+  id          String   @id @default(uuid())
+  teacherId   String
+  subject     String?
+  topic       String?
+  tags        Json?
+  difficulty  String   @default("MEDIUM")
+  text        String
+  explanation String?
+  options     Json
+  createdAt   DateTime @default(now())
+
+  @@index([teacherId])
+  @@index([subject])
+}
+
+model QuizSession {
+  id                   String               @id @default(uuid())
+  quizVersionId        String
+  quizVersion          QuizVersion          @relation(fields: [quizVersionId], references: [id], onDelete: Restrict)
+  createdById          String
+  createdBy            User                 @relation(fields: [createdById], references: [id], onDelete: Restrict)
+  groupId              String?
+  group                Group?               @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  telegramChatId       BigInt?
+  mode                 QuizSessionMode      @default(LIVE_GROUP)
+  status               SessionStatus        @default(PENDING)
+  currentQuestionIndex Int                  @default(0)
+  startedAt            DateTime?
+  completedAt          DateTime?
+  settingsSnapshot     Json?
+  createdAt            DateTime             @default(now())
+  participants         SessionParticipant[]
+  pollInstances        PollInstance[]
+  attempts             QuizAttempt[]
+  exportJobs           ExportJob[]
+
+  @@index([status])
+  @@index([createdById])
+}
+
+model SessionParticipant {
+  id                   String      @id @default(uuid())
+  sessionId            String
+  session              QuizSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  userId               String
+  user                 User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  telegramUserSnapshot Json?
+  score                Int         @default(0)
+  totalAnswered        Int         @default(0)
+  totalCorrect         Int         @default(0)
+  totalTimeMs          BigInt      @default(0)
+  rank                 Int?
+  joinedAt             DateTime    @default(now())
+  completedAt          DateTime?
+
+  @@unique([sessionId, userId])
+  @@index([sessionId])
+}
+
+model PollInstance {
+  id              String       @id @default(uuid())
+  sessionId       String
+  session         QuizSession  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  questionId      String
+  question        Question     @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  telegramPollId  String       @unique
+  messageId       Int?
+  chatId          BigInt?
+  correctOptionId Int
+  isOpen          Boolean      @default(true)
+  sentAt          DateTime     @default(now())
+  closedAt        DateTime?
+  expiresAt       DateTime?
+  answers         PollAnswer[]
+
+  @@index([sessionId])
+  @@index([telegramPollId])
+}
+
+model PollAnswer {
+  id              String       @id @default(uuid())
+  pollInstanceId  String
+  pollInstance    PollInstance @relation(fields: [pollInstanceId], references: [id], onDelete: Cascade)
+  userId          String
+  user            User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  telegramPollId  String
+  selectedOptions Json
+  isCorrect       Boolean
+  responseTimeMs  Int          @default(0)
+  answeredAt      DateTime     @default(now())
+
+  @@unique([pollInstanceId, userId])
+  @@index([pollInstanceId])
+}
+
+model QuizAttempt {
+  id              String          @id @default(uuid())
+  sessionId       String?
+  session         QuizSession?    @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  quizVersionId   String
+  quizVersion     QuizVersion     @relation(fields: [quizVersionId], references: [id], onDelete: Cascade)
+  userId          String
+  user            User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  score           Int             @default(0)
+  totalCorrect    Int             @default(0)
+  totalIncorrect  Int             @default(0)
+  totalUnanswered Int             @default(0)
+  percentage      Float           @default(0)
+  totalDurationMs BigInt          @default(0)
+  status          String          @default("COMPLETED")
+  startedAt       DateTime        @default(now())
+  completedAt     DateTime?
+  answers         AttemptAnswer[]
+
+  @@index([userId])
+}
+
+model AttemptAnswer {
+  id                  String      @id @default(uuid())
+  attemptId           String
+  attempt             QuizAttempt @relation(fields: [attemptId], references: [id], onDelete: Cascade)
+  questionId          String
+  question            Question    @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  selectedOptionIndex Int
+  isCorrect           Boolean
+  responseTimeMs      Int         @default(0)
+  answeredAt          DateTime    @default(now())
+
+  @@index([attemptId])
+}
+
+model ImportJob {
+  id               String        @id @default(uuid())
+  userId           String
+  user             User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  originalFileName String
+  fileSizeBytes    Int
+  status           String        @default("PROCESSING")
+  totalQuestions   Int           @default(0)
+  validQuestions   Int           @default(0)
+  invalidQuestions Int           @default(0)
+  imagesCount      Int           @default(0)
+  formulasCount    Int           @default(0)
+  errorDetails     Json?
+  createdAt        DateTime      @default(now())
+  issues           ImportIssue[]
+}
+
+model ImportIssue {
+  id            String    @id @default(uuid())
+  importJobId   String
+  importJob     ImportJob @relation(fields: [importJobId], references: [id], onDelete: Cascade)
+  questionIndex Int?
+  issueType     String
+  description   String
+  rawContent    String?
+
+  @@index([importJobId])
+}
+
+model ExportJob {
+  id        String      @id @default(uuid())
+  sessionId String
+  session   QuizSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  fileType  String      @default("xlsx")
+  filePath  String?
+  status    String      @default("COMPLETED")
+  createdAt DateTime    @default(now())
+
+  @@index([sessionId])
+}
+
+model PlatformSetting {
+  id        String   @id @default(uuid())
+  key       String   @unique
+  value     Json
+  updatedAt DateTime @updatedAt
+}
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action     String
+  targetType String?
+  targetId   String?
+  ipAddress  String?
+  details    Json?
+  createdAt  DateTime @default(now())
+
+  @@index([userId])
+  @@index([action])
+}
+
+model BackgroundJobRecord {
+  id           String   @id @default(uuid())
+  queueName    String
+  jobId        String   @unique
+  status       String
+  data         Json?
+  result       Json?
+  failedReason String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}

@@ -1,0 +1,28 @@
+{
+  "name": "smart-quiz-platform-root",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Smart Quiz Platform - Professional Telegram Quiz Bot & Educational Management System",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -p \"[{name}]\" -n \"API,WEB\" -c \"blue.bold,green.bold\" \"npm run dev -w @smart-quiz/api\" \"npm run dev -w @smart-quiz/web\"",
+    "dev:api": "npm run dev -w @smart-quiz/api",
+    "dev:web": "npm run dev -w @smart-quiz/web",
+    "build": "npm run build --workspaces",
+    "start": "npm run start -w @smart-quiz/api",
+    "db:generate": "npm run db:generate -w @smart-quiz/database",
+    "db:migrate": "npm run db:migrate -w @smart-quiz/database",
+    "db:seed": "npm run db:seed -w @smart-quiz/database",
+    "test": "npm run test --workspaces --if-present",
+    "test:unit": "npm run test:unit -w @smart-quiz/docx-parser && npm run test:unit -w @smart-quiz/quiz-engine",
+    "lint": "npm run lint --workspaces --if-present"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "cross-env": "^7.0.3",
+    "typescript": "^5.4.5"
+  }
+}

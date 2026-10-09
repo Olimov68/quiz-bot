@@ -1,0 +1,27 @@
+{
+  "name": "@smart-quiz/database",
+  "version": "1.0.0",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -b",
+    "dev": "tsc -b -w",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev --name init",
+    "db:deploy": "prisma migrate deploy",
+    "db:push": "prisma db push",
+    "db:seed": "tsx ./src/seed.ts",
+    "clean": "rimraf dist"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.14.0",
+    "@smart-quiz/shared": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.7",
+    "prisma": "^5.14.0",
+    "rimraf": "^5.0.5",
+    "tsx": "^4.9.3",
+    "typescript": "^5.4.5"
+  }
+}
