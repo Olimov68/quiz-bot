@@ -17,26 +17,26 @@ export const UZ_MENUS = {
 export const UZ_MESSAGES = {
   WELCOME: (name: string) =>
     `Assalomu alaykum, <b>${name}</b>!\n\n` +
-    `<b>Smart Quiz Platform</b> — zamonaviy ta'limiy test platformasiga xush kelibsiz.\n\n` +
+    `<b>Smart Quiz Platform</b> — zamonaviy ta'limiy test botiga xush kelibsiz.\n\n` +
     `Bu yerda siz:\n` +
-    `• Word (.docx) fayllardan testlarni bir zumda yuklashingiz;\n` +
-    `• Matematik va kimyoviy formulali savollar yaratishingiz;\n` +
-    `• Guruhlarga haqiqiy Telegram Quiz Poll shaklida test o'tkazishingiz;\n` +
-    `• Batafsil natijalar va Excel hisobotlarni olishingiz mumkin.\n\n` +
+    `• Testlarni to‘g‘ridan-to‘g‘ri Telegramda savolma-savol yaratishingiz;\n` +
+    `• Guruhlarga haqiqiy Telegram Quiz Poll shaklida jonli test o'tkazishingiz;\n` +
+    `• Har bir savolga vaqt chegarasi va variantlarni sozlashingiz;\n` +
+    `• Batafsil natijalar va 3 varaqli Excel hisobotlarni yuklab olishingiz mumkin.\n\n` +
     `Kerakli bo'limni tanlang:`,
 
   HELP:
     `<b>📖 Smart Quiz Platform — Foydalanish bo'yicha qo'llanma</b>\n\n` +
     `<b>1. Test yaratish:</b>\n` +
-    `«➕ Test yaratish» tugmasini bosing, mavzuni kiriting va Word (.docx) faylini yuboring.\n\n` +
-    `<b>2. Word fayl qoidalari:</b>\n` +
-    `• Savol raqami: <code>1.</code> yoki <code>1)</code>\n` +
-    `• Variantlar: <code>A)</code>, <code>B)</code>, <code>C)</code>, <code>D)</code>\n` +
-    `• To'g'ri javob: variant oldida yulduzcha <code>*C)</code> yoki savol ostida <code>Javob: C</code>\n` +
-    `• Formulalar va rasmlar avtomatik aniqlanadi.\n\n` +
-    `<b>3. Guruhda test o'tkazish:</b>\n` +
-    `Botni guruhingizga admin qilib qo'shing va testni guruhga yuboring. O'quvchilar «✅ Tayyorman» tugmasi orqali qatnashadilar.\n\n` +
-    `Savollaringiz bo'lsa, administrator bilan bog'laning.`,
+    `«➕ Test yaratish» tugmasini bosing, test nomini kiriting. So‘ng har bir savol matni va variantlarini yuborib, to‘g‘ri javob tugmasini tanlang.\n\n` +
+    `<b>2. Guruhda test o'tkazish:</b>\n` +
+    `• Botni guruhingizga qo‘shib <b>Admin</b> huquqini bering.\n` +
+    `• «📚 Testlarim» bo‘limidan test ostidagi «🚀 Guruhda» tugmasini bosing yoki guruhda <code>/startquiz &lt;test_id&gt;</code> buyrug‘ini yuboring.\n` +
+    `• Ishtirokchilar «✅ Tayyorman» tugmasi orqali qatnashadilar.\n\n` +
+    `<b>3. Majburiy obuna:</b>\n` +
+    `Agar bot administrator tomonidan homiy kanallarga ulangan bo‘lsa, ishtirokchilar testga qo‘shilishdan avval ushbu kanallarga a’zo bo‘lishlari lozim.\n\n` +
+    `<b>4. Natijalar va Excel hisobot:</b>\n` +
+    `Test yakunlangach guruhda reyting e’lon qilinadi va «🏆 Natijalar» bo‘limidan to‘liq Excel hisobot yuklab olinadi.`,
 
   CREATE_TITLE_PROMPT: `📝 <b>Test mavzusini kiriting:</b>\n<i>Masalan: Organik kimyo — Alkenlar</i>`,
   CREATE_DESC_PROMPT: `📄 <b>Test haqida qisqacha tavsif kiriting:</b>\n<i>(Ixtiyoriy, o'tkazib yuborish uchun - belgisini yuborishingiz mumkin)</i>`,

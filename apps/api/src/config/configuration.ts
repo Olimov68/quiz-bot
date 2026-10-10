@@ -20,6 +20,7 @@ export interface AppConfig {
   tempStoragePath: string;
   maxDocxSizeMb: number;
   maxImportQuestions: number;
+  requiredChannels: string[];
 }
 
 let devGeneratedJwtSecret: string | null = null;
@@ -56,6 +57,12 @@ export function loadConfig(): AppConfig {
     );
   }
 
+  const requiredChannelsRaw = process.env.REQUIRED_CHANNELS || '';
+  const requiredChannels = requiredChannelsRaw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
   return {
     nodeEnv,
     botToken: process.env.BOT_TOKEN || '',
@@ -74,5 +81,6 @@ export function loadConfig(): AppConfig {
     tempStoragePath: process.env.TEMP_STORAGE_PATH || './storage/temp',
     maxDocxSizeMb: parseInt(process.env.MAX_DOCX_SIZE_MB || '20', 10),
     maxImportQuestions: parseInt(process.env.MAX_IMPORT_QUESTIONS || '500', 10),
+    requiredChannels,
   };
 }

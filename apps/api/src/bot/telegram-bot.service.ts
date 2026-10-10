@@ -22,6 +22,12 @@ import {
 } from '@smart-quiz/shared';
 import { QuizQueueService, PollTimerJobData } from '../queue/quiz-queue.service.js';
 
+export interface RequiredChannel {
+  chatId: string;
+  url: string;
+  name: string;
+}
+
 @Injectable()
 export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(TelegramBotService.name);
@@ -147,6 +153,20 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     if (!this.bot) return;
 
     // 1. /start command
+    const checkSub = async (ctx: any): Promise<boolean> => {
+      if (ctx.chat.type !== 'private') return true;
+      const sub = await this.checkUserSubscription(ctx.from.id);
+      if (!sub.isSubscribed) {
+        const { text: subText, reply_markup } = this.buildSubscriptionMessage(
+          sub.unsubscribedChannels,
+          'check_sub_start'
+        );
+        await ctx.reply(subText, { parse_mode: 'HTML', reply_markup });
+        return false;
+      }
+      return true;
+    };
+
     this.bot.command('start', async (ctx) => {
       const from = ctx.from;
       if (!from) return;
@@ -159,28 +179,37 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         if (ctx.chat.type === 'group' || ctx.chat.type === 'supergroup') {
           await this.handleStartQuizInGroup(ctx, quizId);
         } else {
+          // Individual quiz start: verify subscription first
+          const sub = await this.checkUserSubscription(from.id);
+          if (!sub.isSubscribed) {
+            const { text: subText, reply_markup } = this.buildSubscriptionMessage(
+              sub.unsubscribedChannels,
+              `check_sub_indiv_${quizId}`
+            );
+            await ctx.reply(subText, { parse_mode: 'HTML', reply_markup });
+            return;
+          }
           await this.handleIndividualQuizStart(ctx, user, quizId);
         }
         return;
       }
 
-      const mainKeyboard = new Keyboard()
-        .text(UZ_MENUS.CREATE_QUIZ)
-        .text(UZ_MENUS.MY_QUIZZES)
-        .row()
-        .text(UZ_MENUS.RESULTS)
-        .text(UZ_MENUS.MY_GROUPS)
-        .row()
-        .text(UZ_MENUS.STATISTICS)
-        .text(UZ_MENUS.PROFILE)
-        .row()
-        .text(UZ_MENUS.SETTINGS)
-        .text(UZ_MENUS.HELP)
-        .resized();
+      // Private chat regular start: verify subscription
+      if (ctx.chat.type === 'private') {
+        const sub = await this.checkUserSubscription(from.id);
+        if (!sub.isSubscribed) {
+          const { text: subText, reply_markup } = this.buildSubscriptionMessage(
+            sub.unsubscribedChannels,
+            'check_sub_start'
+          );
+          await ctx.reply(subText, { parse_mode: 'HTML', reply_markup });
+          return;
+        }
+      }
 
       await ctx.reply(UZ_MESSAGES.WELCOME(from.first_name), {
         parse_mode: 'HTML',
-        reply_markup: mainKeyboard,
+        reply_markup: this.getMainKeyboard(),
       });
     });
 
@@ -192,7 +221,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
           '⚠️ <b>Guruhda test boshlash:</b>\n\n' +
           'Test ID raqamini ko‘rsating:\n' +
           '<code>/startquiz &lt;test_id&gt;</code>\n\n' +
-          '<i>Yoki «📚 Testlarim» bo‘limiga kirib test ostidagi «🚀 Guruhda boshlash» tugmasini bosing.</i>',
+          '<i>Yoki «📚 Testlarim» bo‘limiga kirib test ostidagi «🚀 Guruhda» tugmasini bosing.</i>',
           { parse_mode: 'HTML' }
         );
         return;
@@ -216,6 +245,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     // 5. Menu Buttons
     this.bot.hears(UZ_MENUS.CREATE_QUIZ, async (ctx) => {
       if (!ctx.from) return;
+      if (!(await checkSub(ctx))) return;
       this.userStates.set(ctx.from.id.toString(), {
         step: 'awaiting_quiz_title',
         data: { questions: [] },
@@ -231,31 +261,37 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
 
     this.bot.hears(UZ_MENUS.MY_QUIZZES, async (ctx) => {
       if (!ctx.from) return;
+      if (!(await checkSub(ctx))) return;
       await this.showUserQuizzes(ctx);
     });
 
     this.bot.hears(UZ_MENUS.RESULTS, async (ctx) => {
       if (!ctx.from) return;
+      if (!(await checkSub(ctx))) return;
       await this.showUserResults(ctx);
     });
 
     this.bot.hears(UZ_MENUS.MY_GROUPS, async (ctx) => {
       if (!ctx.from) return;
+      if (!(await checkSub(ctx))) return;
       await this.showUserGroups(ctx);
     });
 
     this.bot.hears(UZ_MENUS.STATISTICS, async (ctx) => {
       if (!ctx.from) return;
+      if (!(await checkSub(ctx))) return;
       await this.showUserStats(ctx);
     });
 
     this.bot.hears(UZ_MENUS.PROFILE, async (ctx) => {
       if (!ctx.from) return;
+      if (!(await checkSub(ctx))) return;
       await this.showUserProfile(ctx);
     });
 
     this.bot.hears(UZ_MENUS.SETTINGS, async (ctx) => {
       if (!ctx.from) return;
+      if (!(await checkSub(ctx))) return;
       await this.showUserSettings(ctx);
     });
 
@@ -401,11 +437,12 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         });
 
         const keyboard = new InlineKeyboard()
-          .text('🚀 Guruhda boshlash', `start_group_${quiz.id}`)
+          .text('🚀 Guruhda', `start_group_${quiz.id}`)
+          .text('▶️ O‘zim yechish', `start_indiv_${quiz.id}`)
           .row()
-          .webApp('🌐 Vebda ko‘rish', `${this.config.publicWebUrl}/dashboard/quizzes/${quiz.id}`)
+          .text('📋 Savollar', `view_quiz_${quiz.id}`)
           .row()
-          .text('🗑 O‘chirish', `delete_quiz_${quiz.id}`);
+          .text('🗑 O‘chirish', `confirm_delete_quiz_${quiz.id}`);
 
         await ctx.api.editMessageText(ctx.chat.id, progressMsg.message_id, summaryText, {
           parse_mode: 'HTML',
@@ -732,6 +769,96 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         return;
       }
 
+      // --- Subscription Check Callbacks ---
+      if (data === 'check_sub_start') {
+        const sub = await this.checkUserSubscription(ctx.from.id);
+        if (!sub.isSubscribed) {
+          await ctx.answerCallbackQuery({
+            text: '❌ Siz hali barcha kanallarga a’zo bo‘lmadingiz! Iltimos, obuna bo‘lib qayta tekshiring.',
+            show_alert: true,
+          });
+          return;
+        }
+
+        await ctx.answerCallbackQuery({ text: '✅ Obuna tasdiqlandi!' });
+        try {
+          await ctx.deleteMessage();
+        } catch {}
+        await ctx.reply(
+          `🎉 <b>Obunangiz muvaffaqiyatli tasdiqlandi!</b>\n\n` +
+          UZ_MESSAGES.WELCOME(ctx.from.first_name),
+          {
+            parse_mode: 'HTML',
+            reply_markup: this.getMainKeyboard(),
+          }
+        );
+        return;
+      }
+
+      if (data.startsWith('check_sub_indiv_')) {
+        const quizId = data.replace('check_sub_indiv_', '');
+        const sub = await this.checkUserSubscription(ctx.from.id);
+        if (!sub.isSubscribed) {
+          await ctx.answerCallbackQuery({
+            text: '❌ Siz hali barcha kanallarga a’zo bo‘lmadingiz! Iltimos, obuna bo‘lib qayta tekshiring.',
+            show_alert: true,
+          });
+          return;
+        }
+
+        await ctx.answerCallbackQuery({ text: '✅ Obuna tasdiqlandi!' });
+        try {
+          await ctx.deleteMessage();
+        } catch {}
+        await this.handleIndividualQuizStart(ctx, user, quizId);
+        return;
+      }
+
+      if (data.startsWith('check_sub_join_')) {
+        const sessionId = data.replace('check_sub_join_', '');
+        const sub = await this.checkUserSubscription(ctx.from.id);
+        if (!sub.isSubscribed) {
+          await ctx.answerCallbackQuery({
+            text: '❌ Siz hali barcha kanallarga a’zo bo‘lmadingiz! Iltimos, obuna bo‘lib qayta tekshiring.',
+            show_alert: true,
+          });
+          return;
+        }
+
+        await ctx.answerCallbackQuery({ text: '✅ Obuna tasdiqlandi!' });
+        try {
+          await ctx.deleteMessage();
+        } catch {}
+        const res = await this.registerParticipantInSession(ctx, sessionId, user);
+        if (res.success) {
+          await ctx.reply(
+            '🎉 <b>Siz testga muvaffaqiyatli ro‘yxatdan o‘tdingiz!</b>\n\n' +
+            'Endi guruhga qaytib test boshlanishini kuting.',
+            { parse_mode: 'HTML' }
+          );
+        } else {
+          await ctx.reply(`⚠️ ${res.reason}`);
+        }
+        return;
+      }
+
+      if (data.startsWith('start_indiv_')) {
+        const quizId = data.replace('start_indiv_', '');
+        const sub = await this.checkUserSubscription(ctx.from.id);
+        if (!sub.isSubscribed) {
+          const { text: subText, reply_markup } = this.buildSubscriptionMessage(
+            sub.unsubscribedChannels,
+            `check_sub_indiv_${quizId}`
+          );
+          await ctx.reply(subText, { parse_mode: 'HTML', reply_markup });
+          await ctx.answerCallbackQuery();
+          return;
+        }
+        await ctx.answerCallbackQuery();
+        await this.handleIndividualQuizStart(ctx, user, quizId);
+        return;
+      }
+
       // --- Session Running Callbacks ---
       if (data.startsWith('join_session_')) {
         const sessionId = data.replace('join_session_', '');
@@ -775,6 +902,161 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
   }
 
   // --- Handlers & Helpers ---
+
+  public getMainKeyboard(): Keyboard {
+    return new Keyboard()
+      .text(UZ_MENUS.CREATE_QUIZ)
+      .text(UZ_MENUS.MY_QUIZZES)
+      .row()
+      .text(UZ_MENUS.RESULTS)
+      .text(UZ_MENUS.MY_GROUPS)
+      .row()
+      .text(UZ_MENUS.STATISTICS)
+      .text(UZ_MENUS.PROFILE)
+      .row()
+      .text(UZ_MENUS.SETTINGS)
+      .text(UZ_MENUS.HELP)
+      .resized();
+  }
+
+  public parseRequiredChannels(): RequiredChannel[] {
+    return (this.config.requiredChannels || [])
+      .map((raw, idx) => {
+        const item = raw.trim();
+        if (!item) return null;
+
+        // Format: ID:URL or ID|URL
+        if (item.includes(':') && (item.startsWith('-') || /^\d+/.test(item))) {
+          const [idPart, urlPart] = item.split(':');
+          return {
+            chatId: idPart.trim(),
+            url: urlPart.startsWith('http') ? urlPart.trim() : `https://${urlPart.trim()}`,
+            name: `Kanal ${idx + 1}`,
+          };
+        }
+        if (item.includes('|')) {
+          const [idPart, urlPart] = item.split('|');
+          return {
+            chatId: idPart.trim(),
+            url: urlPart.startsWith('http') ? urlPart.trim() : `https://${urlPart.trim()}`,
+            name: `Kanal ${idx + 1}`,
+          };
+        }
+
+        // URL format: https://t.me/channel_name or t.me/channel_name
+        const linkMatch = item.match(/(?:https?:\/\/)?t\.me\/([a-zA-Z0-9_]+)/);
+        if (linkMatch && !item.includes('/+') && !item.includes('joinchat')) {
+          const username = linkMatch[1];
+          return {
+            chatId: `@${username}`,
+            url: `https://t.me/${username}`,
+            name: `@${username}`,
+          };
+        }
+
+        // Username format: @channel_name
+        if (item.startsWith('@')) {
+          const username = item.replace('@', '');
+          return {
+            chatId: `@${username}`,
+            url: `https://t.me/${username}`,
+            name: `@${username}`,
+          };
+        }
+
+        // Numeric chat ID
+        if (/^-?\d+$/.test(item)) {
+          return {
+            chatId: item,
+            url: `https://t.me/`,
+            name: `Kanal ${idx + 1}`,
+          };
+        }
+
+        // Default username without @
+        return {
+          chatId: `@${item}`,
+          url: `https://t.me/${item}`,
+          name: `@${item}`,
+        };
+      })
+      .filter((c): c is RequiredChannel => c !== null);
+  }
+
+  public async checkUserSubscription(userId: number | bigint): Promise<{
+    isSubscribed: boolean;
+    unsubscribedChannels: RequiredChannel[];
+  }> {
+    if (!this.bot) return { isSubscribed: true, unsubscribedChannels: [] };
+
+    // Super Admin bypass
+    if (this.config.superAdminTelegramIds.includes(userId.toString())) {
+      return { isSubscribed: true, unsubscribedChannels: [] };
+    }
+
+    const channels = this.parseRequiredChannels();
+    if (channels.length === 0) {
+      return { isSubscribed: true, unsubscribedChannels: [] };
+    }
+
+    const unsubscribed: RequiredChannel[] = [];
+
+    for (const channel of channels) {
+      try {
+        const member = await this.bot.api.getChatMember(channel.chatId, Number(userId));
+        const activeStatuses = ['creator', 'administrator', 'member'];
+        const isMember =
+          activeStatuses.includes(member.status) ||
+          (member.status === 'restricted' && (member as any).is_member === true);
+
+        if (!isMember) {
+          unsubscribed.push(channel);
+        }
+      } catch (err: any) {
+        const errMsg = err?.message || '';
+        this.logger.warn(`Kanal (${channel.chatId}) a'zoligini tekshirishda xatolik: ${errMsg}`);
+
+        if (errMsg.includes('user not found') || errMsg.includes('PARTICIPANT_ID_INVALID')) {
+          unsubscribed.push(channel);
+        } else if (
+          errMsg.includes('chat not found') ||
+          errMsg.includes('bot is not a member') ||
+          errMsg.includes('not enough rights')
+        ) {
+          this.logger.error(
+            `⚠️ DIQQAT: Bot "${channel.chatId}" kanaliga a'zo yoki admin qilinmagan! Iltimos, botni kanalga admin qilib qo'shing.`
+          );
+        } else {
+          unsubscribed.push(channel);
+        }
+      }
+    }
+
+    return {
+      isSubscribed: unsubscribed.length === 0,
+      unsubscribedChannels: unsubscribed,
+    };
+  }
+
+  public buildSubscriptionMessage(
+    unsubscribed: RequiredChannel[],
+    checkCallbackData: string
+  ): { text: string; reply_markup: InlineKeyboard } {
+    let text =
+      `⚠️ <b>Kanalga a’zo bo‘lish talab etiladi!</b>\n\n` +
+      `Botdan to‘liq foydalanish va testlarni yechish uchun quyidagi homiy / rasmiy kanal(lar)imizga obuna bo‘ling:\n\n`;
+
+    const kb = new InlineKeyboard();
+    unsubscribed.forEach((ch, idx) => {
+      text += `${idx + 1}. <b>${ch.name}</b>\n`;
+      kb.url(`📢 A’zo bo‘lish (${ch.name})`, ch.url).row();
+    });
+
+    text += `\nObuna bo‘lgach, pastdagi <b>«✅ Obunani tekshirish»</b> tugmasini bosing:`;
+    kb.text(`✅ Obunani tekshirish`, checkCallbackData);
+
+    return { text, reply_markup: kb };
+  }
 
   private async upsertTelegramUser(from: any) {
     const isSuperAdmin = this.config.superAdminTelegramIds.includes(from.id.toString());
@@ -826,7 +1108,9 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       const qCount = q.versions[0]?._count?.questions || 0;
       text += `${idx + 1}. <b>${q.title}</b> (${qCount} ta savol)\n`;
       keyboard
-        .text(`🚀 Boshlash`, `start_group_${q.id}`)
+        .text(`🚀 Guruhda`, `start_group_${q.id}`)
+        .text(`▶️ O‘zim yechish`, `start_indiv_${q.id}`)
+        .row()
         .text(`📋 Savollar (${qCount})`, `view_quiz_${q.id}`)
         .text(`🗑`, `confirm_delete_quiz_${q.id}`)
         .row();
@@ -1096,6 +1380,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     const kb = new InlineKeyboard()
       .url('👥 Guruhga qo‘shish va boshlash', `https://t.me/${cleanUsername}?startgroup=startquiz_${quiz.id}`)
       .row()
+      .text('▶️ O‘zim yechish', `start_indiv_${quiz.id}`)
       .text('📋 Savollarni ko‘rish', `view_quiz_${quiz.id}`);
 
     await ctx.reply(
@@ -1173,6 +1458,45 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async handleJoinSession(ctx: any, user: any, sessionId: string) {
+    const sub = await this.checkUserSubscription(ctx.from.id);
+    if (!sub.isSubscribed) {
+      const { text, reply_markup } = this.buildSubscriptionMessage(
+        sub.unsubscribedChannels,
+        `check_sub_join_${sessionId}`
+      );
+      try {
+        await this.bot!.api.sendMessage(ctx.from.id, text, {
+          parse_mode: 'HTML',
+          reply_markup,
+        });
+        await ctx.answerCallbackQuery({
+          text: '⚠️ Testda qatnashish uchun avval homiy kanallarga a’zo bo‘ling! Shaxsiy xabaringizga havola yuborildi.',
+          show_alert: true,
+        });
+      } catch {
+        const chList = sub.unsubscribedChannels.map((c) => c.name).join(', ');
+        await ctx.answerCallbackQuery({
+          text: `⚠️ Testda qatnashish uchun kanalga a’zo bo‘ling:\n${chList}\n\nSo‘ng botga /start bosing!`,
+          show_alert: true,
+        });
+      }
+      return;
+    }
+
+    const res = await this.registerParticipantInSession(ctx, sessionId, user);
+    if (!res.success) {
+      await ctx.answerCallbackQuery({ text: res.reason || 'Xatolik yuz berdi', show_alert: true });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: 'Siz ro‘yxatga olindingiz! ✅' });
+  }
+
+  private async registerParticipantInSession(
+    ctx: any,
+    sessionId: string,
+    user: any
+  ): Promise<{ success: boolean; reason?: string }> {
     const session = await this.prisma.quizSession.findUnique({
       where: { id: sessionId },
       include: {
@@ -1182,8 +1506,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     });
 
     if (!session || session.status !== SessionStatus.WAITING_PARTICIPANTS) {
-      await ctx.answerCallbackQuery({ text: 'Test allaqachon boshlangan yoki yakunlangan!', show_alert: true });
-      return;
+      return { success: false, reason: 'Test allaqachon boshlangan yoki yakunlangan!' };
     }
 
     await this.prisma.sessionParticipant.upsert({
@@ -1205,8 +1528,6 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       where: { sessionId },
     });
 
-    await ctx.answerCallbackQuery({ text: 'Siz ro‘yxatga olindingiz! ✅' });
-
     // Update lobby message count
     const timePerQuestion = (session.settingsSnapshot as any)?.timeLimitPerQuestionSeconds ?? 30;
     const questionsCount = await this.prisma.question.count({
@@ -1226,8 +1547,12 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       .text(UZ_MENUS.START_QUIZ, `launch_session_${session.id}`);
 
     try {
-      await ctx.editMessageText(updatedLobbyText, { parse_mode: 'HTML', reply_markup: keyboard });
+      if (ctx.editMessageText) {
+        await ctx.editMessageText(updatedLobbyText, { parse_mode: 'HTML', reply_markup: keyboard });
+      }
     } catch {}
+
+    return { success: true };
   }
 
   private async handleLaunchSession(ctx: any, user: any, sessionId: string) {
